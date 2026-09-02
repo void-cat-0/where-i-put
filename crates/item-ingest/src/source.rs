@@ -148,6 +148,16 @@ pub mod rtsp {
             let mut dic = ffmpeg::Dictionary::new();
             dic.set("rtsp_transport", "tcp");
             dic.set("timeout", "5000000"); // microseconds; avoids "timed out" on read
+            // Live-low-latency tuning: ffmpeg's defaults buffer ~0.5s of the
+            // stream during input probing and keep it queued as "playback
+            // backlog" forever for a live source. Keep reads minimal so
+            // packets flow out as they arrive. `timeout` (socket I/O) is
+            // distinct from `rw_timeout`; for RTSP, use the `timeout`
+            // above and these two for backlog.
+            dic.set("probesize", "32"); // bytes needed to guess streams; tiny
+            dic.set("analyzeduration", "100000"); // 0.1s of analysis at most
+            dic.set("fflags", "nobuffer+flush_packets"); // minimize read queueing
+            dic.set("max_delay", "100000"); // microseconds of muxer jitter buffer
 
             let input = ffmpeg::format::input_with_dictionary(url, dic).map_err(err)?;
             let (video_index, decoder, scaler, rgb_frame) = {
@@ -162,12 +172,18 @@ pub mod rtsp {
                 // HEVC software decode is frame-heavy; rust-ffmpeg defaults to a
                 // single decoder thread (ffmpeg CLI picks "auto"). 4 threads
                 // brought 720p25 preview from ~13 fps to full rate on an
-                // 8-core machine.
+                // 8-core machine. Cost: frame threading reorders ~4 frames
+                // in flight (~160ms latency tax; slice threading would avoid
+                // it but HEVC slice parallelism is rare in camera streams).
                 context.set_threading(ffmpeg::codec::threading::Config {
                     kind: ffmpeg::codec::threading::Type::Frame,
                     count: 4,
                     ..Default::default()
                 });
+                // No B-frames in this stream (verified: has_b_frames=0), so
+                // telling the decoder to emit each frame immediately is safe
+                // and shaves one frame of internal reordering.
+                context.set_flags(ffmpeg::codec::Flags::LOW_DELAY);
                 let decoder = context.decoder().video().map_err(err)?;
                 let scaler = ffmpeg::software::scaling::context::Context::get(
                     decoder.format(),
