@@ -48,6 +48,27 @@ struct Args {
     #[cfg(feature = "rtsp")]
     #[arg(long)]
     preview: Option<String>,
+
+    /// Run the YOLO-onnx detector on one JPEG/PNG image and exit
+    /// (requires `--features yolo`). Prints detections + timing.
+    #[cfg(feature = "yolo")]
+    #[arg(long)]
+    detect: Option<String>,
+
+    /// Model path for --detect (yolov8n/yolo11n export, dynamic or 640 input).
+    #[cfg(feature = "yolo")]
+    #[arg(long, default_value = "models/yolov8n.onnx")]
+    model: String,
+
+    /// Input tensor size the ONNX graph was exported at.
+    #[cfg(feature = "yolo")]
+    #[arg(long, default_value_t = 640)]
+    input_size: usize,
+
+    /// Confidence floor for --detect.
+    #[cfg(feature = "yolo")]
+    #[arg(long, default_value_t = 0.3)]
+    conf: f32,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -56,6 +77,9 @@ fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
         )
+        // stdout is reserved for command output (e.g. --detect results);
+        // logs (including the ort bridge, which is noisy) go to stderr.
+        .with_writer(std::io::stderr)
         .init();
 
     let args = Args::parse();
@@ -66,6 +90,11 @@ fn main() -> anyhow::Result<()> {
 
     if args.demo {
         return demo_pass(&store);
+    }
+
+    #[cfg(feature = "yolo")]
+    if let Some(img) = args.detect.as_deref() {
+        return detect_pass(img, &args.model, args.input_size, args.conf);
     }
 
     #[cfg(feature = "rtsp")]
@@ -139,6 +168,46 @@ fn redact_url(url: &str) -> String {
         },
         None => url.to_string(),
     }
+}
+
+/// Run YOLO-onnx on a single image file (yolo verification / smoke test):
+/// decode -> detect -> NMS report with timing.
+#[cfg(feature = "yolo")]
+fn detect_pass(img_path: &str, model_path: &str, input_size: usize, conf: f32) -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    use item_ingest::detector::yolo::YoloDetector;
+    use item_ingest::detector::{COCO_LABELS, Detector};
+
+    let img = image::open(img_path)
+        .with_context(|| format!("opening {}", img_path))?
+        .to_rgb8();
+    let (w, h) = img.dimensions();
+    let started = Instant::now();
+    let det = YoloDetector::new(
+        std::path::Path::new(model_path),
+        COCO_LABELS.iter().map(|s| s.to_string()).collect(),
+        input_size,
+        conf,
+    )
+    .map_err(|e| anyhow::anyhow!("model load: {e}"))?;
+    let load_ms = started.elapsed();
+    let raw = det.detect(img.as_raw(), w, h).map_err(|e| anyhow::anyhow!("inference: {e}"))?;
+    let infer_ms = started.elapsed();
+    let kept: Vec<_> = item_core::geo::nms(&raw, 0.45)
+        .into_iter()
+        .map(|i| raw[i].clone())
+        .collect();
+    println!("load {:.0}ms | inference {:.0}ms | {} raw -> {} kept",
+        load_ms.as_secs_f64() * 1e3,
+        (infer_ms - load_ms).as_secs_f64() * 1e3,
+        raw.len(),
+        kept.len());
+    for d in &kept {
+        println!("  {:<14} {:>5.0}%  [{:.0}, {:.0}, {:.0}, {:.0}]",
+            d.label, d.confidence * 100.0, d.bbox[0], d.bbox[1], d.bbox[2], d.bbox[3]);
+    }
+    Ok(())
 }
 
 /// Pull N frames from an RTSP camera through the NullDetector plumbing and log

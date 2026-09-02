@@ -33,6 +33,9 @@ cargo run --features rtsp -p item-ingest -- --rtsp "rtsp://user:pass@192.168.1.5
 # live web preview (MJPEG bridge; browsers can't speak RTSP) — open http://<host>:8477/preview
 cargo run --features rtsp -p item-ingest -- --preview "rtsp://user:pass@192.168.1.50:554/Streaming/Channels/101"
 
+# object detection on one image (needs a local models/yolov8n.onnx, see below)
+cargo run --features yolo -p item-ingest -- --detect path/to/photo.jpg
+
 # webhook receiver (point Frigate event forwarding at POST /frigate/webhook)
 cargo run -p item-ingest -- --listen 127.0.0.1:8477
 
@@ -91,6 +94,10 @@ port can watch (gate with a proxy/Tailscale before exposing beyond the LAN).
 - Regions are manual pixel rects per camera; no auto spatial calibration.
 - sqlite-vec embeddings not wired yet: keyword lookup carries v1, and vectors
   should be a rebuildable cache.
-- ort pinned to 2.0-rc (1.16.x all yanked); the `yolo` module is compile-marked
-  as not yet verified against the 2.0 API and is off by default.
+- ort pinned to 2.0-rc (1.16.x all yanked); the `yolo` module is verified
+  against that API: detection on bus.jpg matches Ultralytics reference
+  output, and `--detect` runs on live camera frames. Models are not vendored
+  (`/models` is git-ignored); drop any stock Ultralytics YOLOv8/11 ONNX
+  export (opset ≤ 17) at `models/yolov8n.onnx`. Beware hobby exports with
+  custom preprocessing nodes (e.g. HzPreprocess) — ort can't run them.
 - Snapshot storage keeps references (frigate://...), never copies pixels yet.

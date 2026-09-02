@@ -4,6 +4,24 @@
 use item_core::Detection;
 use thiserror::Error;
 
+/// COCO 80-class labels, the vocabulary of stock Ultralytics exports
+/// (yolov8n/yolo11n ONNX). Index order is the model's class axis.
+pub const COCO_LABELS: &[&str] = &[
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep",
+    "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+    "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
+    "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+    "couch", "potted plant", "bed", "dining table", "toilet", "tv",
+    "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+    "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+    "scissors", "teddy bear", "hair drier", "toothbrush",
+];
+
 #[derive(Debug, Error)]
 pub enum DetectorError {
     #[error(transparent)]
@@ -26,13 +44,15 @@ impl Detector for NullDetector {
 
 #[cfg(feature = "yolo")]
 pub mod yolo {
-    //! YOLO via ONNX Runtime. Preprocess (letterbox) + postprocess (confidence
-    //! decode + per-class filter) follow the layout of the `yolo-rs` crate;
-    //! NMS itself stays in `item_core::geo` so both backends share it.
+    //! YOLO via ONNX Runtime (ort 2.0-rc, compile-verified and validated on
+    //! bus.jpg + live camera frames). Preprocess (resize + CHW normalize) and
+    //! postprocess (transpose-aware attr indexing + per-class argmax) handle
+    //! stock Ultralytics exports ([1, 84, 8400] and [1, 8400, 84] alike,
+    //! static or dynamic input); NMS stays in `item_core::geo`. Custom-op
+    //! hobby exports (HzPreprocess etc.) are rejected by ort at load time.
     //!
-    //! Model on disk: any YOLOv8/11 detection export in ONNX with output
-    //! shape [1, 4+num_classes, num_boxes] (e.g. `yolo11n.onnx`, class names
-    //! COCO). Fetch once with `hf-hub` and point `model_path` at it.
+    //! Model on disk: any YOLOv8/11 detection export in ONNX (opset ≤ 17),
+    //! COCO 80 classes (see `COCO_LABELS`), e.g. `models/yolov8n.onnx`.
 
     use ort::session::Session;
     use ort::value::Tensor;
@@ -101,22 +121,25 @@ pub mod yolo {
             let outputs = session
                 .run(ort::inputs![input])
                 .map_err(|e| DetectorError::Inference(Box::new(e)))?;
-            let (shape, data): (Vec<usize>, Vec<f32>) = outputs[0]
+            // ort 2.0 borrows the output tensor: (&Shape, &[f32]).
+            let (shape, data) = outputs[0]
                 .try_extract_tensor::<f32>()
                 .map_err(|e| DetectorError::Inference(Box::new(e)))?;
-            // expect [1, 4+nc, n] (v8/11 style)
-            if shape.len() != 3 {
+            let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+            // expect [1, 4+nc, n] (v8/11 default, attrs on rows) or the
+            // transposed [1, n, 4+nc] some exports use.
+            if dims.len() != 3 {
                 return Err(DetectorError::Inference("unexpected output rank".into()));
             }
-            let (dim1, dim2) = (shape[1], shape[2]);
-            let n_attr = if dim1 > dim2 { dim1 } else { dim2 };
-            let n_boxes = if dim1 > dim2 { dim2 } else { dim1 };
-            let transposed = dim1 < dim2; // attrs on rows => [1, n, attrs]
+            let (dim1, dim2) = (dims[1], dims[2]);
+            // attrs = the small dim (84), boxes = the large (8400)
+            let (n_attr, n_boxes, attrs_on_rows) =
+                if dim1 < dim2 { (dim1, dim2, true) } else { (dim2, dim1, false) };
             let attr = |b: usize, a: usize| -> f32 {
-                if transposed {
-                    data[b * n_attr + a]
-                } else {
+                if attrs_on_rows {
                     data[a * n_boxes + b]
+                } else {
+                    data[b * n_attr + a]
                 }
             };
 

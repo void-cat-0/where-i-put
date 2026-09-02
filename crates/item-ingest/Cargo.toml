@@ -18,10 +18,10 @@ anyhow.workspace = true
 clap.workspace = true
 
 # Optional backends, off by default so the skeleton builds without native deps:
-# - ort: ONNX Runtime for real YOLO inference (requires downloading onnxruntime).
-#   Note: all 1.16.x releases were yanked upstream; the 2.0-rc line is current.
-#   The `yolo` module has NOT been compile-checked against the 2.0 API yet.
-# - nokhwa: local/USB/RTSP camera capture
+# - ort: ONNX Runtime for real YOLO inference; auto-downloads onnxruntime at
+#   build time (default feature). Note: all 1.16.x releases were yanked
+#   upstream, hence the 2.0-rc pin; the yolo module is verified against it.
+# - nokhwa: local/USB camera capture (no RTSP support; use rtsp feature)
 [dependencies.ort]
 version = "2.0.0-rc.13"
 optional = true
