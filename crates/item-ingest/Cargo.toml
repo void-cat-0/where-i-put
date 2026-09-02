@@ -1,0 +1,45 @@
+[package]
+name = "item-ingest"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+item-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+image.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+
+# Optional backends, off by default so the skeleton builds without native deps:
+# - ort: ONNX Runtime for real YOLO inference (requires downloading onnxruntime).
+#   Note: all 1.16.x releases were yanked upstream; the 2.0-rc line is current.
+#   The `yolo` module has NOT been compile-checked against the 2.0 API yet.
+# - nokhwa: local/USB/RTSP camera capture
+[dependencies.ort]
+version = "2.0.0-rc.13"
+optional = true
+
+[dependencies.nokhwa]
+version = "0.10"
+optional = true
+default-features = false
+features = ["input-native", "decoding"]
+
+# RTSP/IP-camera frame source via FFmpeg (links native libav*; see README for
+# the FFMPEG_DIR setup used on this machine).
+[dependencies.ffmpeg-next]
+version = "9"
+optional = true
+
+[features]
+default = []
+yolo = ["dep:ort"]
+camera = ["dep:nokhwa"]
+rtsp = ["dep:ffmpeg-next"]

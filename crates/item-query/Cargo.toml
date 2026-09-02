@@ -1,0 +1,16 @@
+[package]
+name = "item-query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+item-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
