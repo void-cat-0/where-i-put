@@ -1,4 +1,4 @@
-# item-finders
+# where-i-put
 
 Vision-based item memory: watch cameras (or a Frigate NVR's events), remember
 where objects were last seen, answer "where are my keys?".
