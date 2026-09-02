@@ -26,7 +26,7 @@ Three crates, one-way dependencies (`item-query`/`item-ingest` -> `item-core`):
 # pipeline smoke test, no hardware needed
 cargo run -p item-ingest -- --demo
 
-# RTSP camera (see "RTSP backend" for env setup)
+# RTSP camera (one-time: `cargo xtask setup` to fetch FFmpeg + libclang)
 cargo run --features rtsp -p item-ingest -- --rtsp "rtsp://user:pass@192.168.1.50:554/Streaming/Channels/101" --camera-id living
 
 # webhook receiver (point Frigate event forwarding at POST /frigate/webhook)
@@ -41,32 +41,32 @@ ITEM_VLM_BASE_URL=http://127.0.0.1:8080/v1 ITEM_VLM_MODEL=qwen2.5vl cargo run -p
 
 Pulls IP cameras through `ffmpeg-next` (libavformat + swscale, see
 `item_ingest::source::rtsp`). This is the only backend that links native C
-libraries, so building it needs a dev toolchain: MSVC (cc-rs probe) and
-libclang (bindgen) on top of the usual.
-
-The Windows setup used for development vendors everything under `vendor/`
-(git-ignored, ~700 MB with build artifacts):
-
-- `vendor/ffmpeg/` — **FFmpeg 7.1** from BtbN's `*-win64-gpl-shared-7.1.zip`
-  (include/ + lib/ + bin/ DLLs). Version matters: rust-ffmpeg 9.x supports
-  FFmpeg ≤ 7.x; the master-branch build (FFmpeg 8, `avcodec-63.dll`) breaks
-  the sys crate's version probe and is rejected by bindgen.
-- `vendor/libclang/native/` — `libclang.dll` extracted from the `libclang`
-  PyPI wheel (18.1.1). Any LLVM ≥ 9 works; a full LLVM install is overkill.
-- `vendor/ffmpeg/bin/*.dll` must sit next to the built exe (copied by hand)
-  or be on PATH at *run* time — Windows loader finds them there, not via
-  build-time env.
-
-Build + run:
+libraries, so building it needs FFmpeg 7.1 + libclang on top of the usual
+MSVC toolchain. One command:
 
 ```sh
-export FFMPEG_DIR="$PWD/vendor/ffmpeg"
-export LIBCLANG_PATH="$PWD/vendor/libclang/native"
-cargo run --features rtsp -p item-ingest -- --rtsp rtsp://... --camera-id living
+cargo xtask setup        # fetches into target/vendor/, verified by sha256
+cargo build --features rtsp
 ```
 
-Dev-loop tip: a local RTSP test stream is two commands with the vendored
-ffmpeg binary — `mediamtx.exe` (also vendored for testing) plus
+No manual env vars: `.cargo/config.toml` points `FFMPEG_DIR`,
+`LIBCLANG_PATH`, and the runtime `PATH` at `target/vendor/`, and `xtask
+setup` fills exactly those paths (pinned URLs + hashes live in
+`crates/xtask/src/main.rs`, module `pins`; each cached dir carries a
+`manifest.json` recording url/sha/contents). Because the cache lives under
+`target/`, `cargo clean` wipes it — re-run setup to restore.
+`cargo xtask status` reports cached/missing/stale.
+
+Linux works the same way; macOS has no BtbN build — use `brew install
+ffmpeg` + system LLVM (setup prints hints, and externally-set
+`FFMPEG_DIR`/`LIBCLANG_PATH` win over config.toml).
+
+Version warning: rust-ffmpeg 9.x supports FFmpeg ≤ 7.x. BtbN's rolling
+`latest` tag is FFmpeg 8 (`avcodec-63.dll`) and the sys crate's probe
+rejects it — stay on the pinned 7.1 asset.
+
+Dev-loop tip: `vendor/mediamtx.exe` + the vendored ffmpeg binary make a
+local RTSP test stream —
 `ffmpeg -re -stream_loop -1 -i test.mp4 -c copy -f rtsp -rtsp_transport tcp
 rtsp://127.0.0.1:8554/cam1`. Verified end to end: decode -> RGB8 -> store.
 

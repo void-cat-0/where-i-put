@@ -1,0 +1,384 @@
+//! xtask: developer tooling entry point (`cargo xtask setup` / `cargo xtask status`).
+//!
+//! Downloads and unpacks the native toolchain that the `rtsp` feature needs
+//! (FFmpeg 7.1 shared build + libclang for bindgen) into `target/vendor/`, so
+//! a `cargo clean` wipes everything and re-running setup is cheap. `.cargo/
+//! config.toml` points FFMPEG_DIR/LIBCLANG_PATH at these paths, making
+//! `cargo build --features rtsp` work with zero manual env vars.
+//!
+//! Why a setup task and not a build-script auto-fetch: cargo runs build
+//! scripts in dependency order, and ffmpeg-sys-next (which reads FFMPEG_DIR)
+//! builds before any crate that could populate it — we'd have to fork the sys
+//! crate to close that loop. Download + sha256 pin + manifest.json per
+//! artifact is the 80% solution, and the manifest records what each cached
+//! directory contains and where it came from.
+
+use std::fs;
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// Version pins for the rtsp toolchain.
+///
+/// FFmpeg is constrained by rust-ffmpeg 9.x: it probes the FFmpeg ABI and
+/// rejects 8.x (BtbN's rolling "latest" tag ships FFmpeg master = avcodec-63;
+/// never pin that URL). 7.1 is the supported tip. BtbN publishes Linux and
+/// Windows builds only — macOS users get a brew instruction instead.
+mod pins {
+    pub const BTBN_TAG: &str = "autobuild-2026-07-31-14-10";
+    pub const BTBN_BASE: &str = "ffmpeg-n7.1.5-12-g1fdbca85aa";
+    /// sha256 of the downloaded archive, per BtbN platform key. win64 was
+    /// captured from a verified setup run; others get computed on first use.
+    pub const FFMPEG_SHA: &[(&str, &str)] = &[(&"win64", "3e61e96b44bce30f0fad9fc31955be7fe4d6690d6a5a2b65c62494e262f8369e")];
+    /// libclang via the PyPI wheel (smallest blessed source for the DLL
+    /// bindgen needs). Linux/macOS rely on system LLVM (`apt install
+    /// libclang-dev` / brew llvm).
+    pub const LIBCLANG_WIN_WHEEL: &str = "https://mirrors.ustc.edu.cn/pypi/web/packages/0b/2d/3f480b1e1d31eb3d6de5e3ef641954e5c67430d5ac93b7fa7e07589576c7/libclang-18.1.1-py2.py3-none-win_amd64.whl";
+    // sha256 of the .whl archive itself (PyPI's published hash for this file),
+    // NOT the extracted libclang.dll.
+    pub const LIBCLANG_WIN_SHA: &str =
+        "4dd2d3b82fab35e2bf9ca717d7b63ac990a3519c7e312f19fa8e86dcc712f7fb";
+}
+
+fn platform() -> &'static str {
+    if cfg!(windows) {
+        "win64"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_arch = "aarch64") {
+        "linuxarm64"
+    } else {
+        "linux64"
+    }
+}
+
+struct Artifact {
+    /// Local directory name under target/vendor/.
+    name: &'static str,
+    url: String,
+    sha256: Option<String>,
+    kind: ArtifactKind,
+}
+
+enum ArtifactKind {
+    /// Unpack whole archive, stripping the single wrapping top-level dir.
+    ArchiveFlatten,
+    /// Pull `*/clang/native/libclang.dll` out of a wheel to `native/`.
+    LibclangDll,
+    /// Nothing to fetch on this platform; setup prints `hint` instead.
+    NotProvided,
+}
+
+fn artifacts() -> Vec<Artifact> {
+    let os = platform();
+    let ffmpeg = match os {
+        "win64" | "linux64" | "linuxarm64" => {
+            let ext = if os == "win64" { "zip" } else { "tar.xz" };
+            Artifact {
+                name: "ffmpeg",
+                url: format!(
+                    "https://github.com/BtbN/FFmpeg-Builds/releases/download/{}/{BTBN_BASE}-{os}-gpl-shared-7.1.{ext}",
+                    pins::BTBN_TAG,
+                    BTBN_BASE = pins::BTBN_BASE,
+                    os = os
+                ),
+                sha256: pins::FFMPEG_SHA.iter().find(|(k, _)| *k == os).map(|(_, v)| v.to_string()),
+                kind: ArtifactKind::ArchiveFlatten,
+            }
+        }
+        _ => Artifact { name: "ffmpeg", url: String::new(), sha256: None, kind: ArtifactKind::NotProvided },
+    };
+    let libclang = if os == "win64" {
+        Artifact {
+            name: "libclang",
+            url: pins::LIBCLANG_WIN_WHEEL.into(),
+            sha256: Some(pins::LIBCLANG_WIN_SHA.into()),
+            kind: ArtifactKind::LibclangDll,
+        }
+    } else {
+        Artifact { name: "libclang", url: String::new(), sha256: None, kind: ArtifactKind::NotProvided }
+    };
+    vec![ffmpeg, libclang]
+}
+
+#[derive(Parser)]
+#[command(name = "xtask")]
+struct Args {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Download + verify + unpack the native toolchain into target/vendor/.
+    Setup {
+        /// Refetch even when the cache matches the pins.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Report which artifacts are cached vs. missing/stale.
+    Status,
+}
+
+/// `target/vendor` — deliberately under target/ so `cargo clean` wipes it.
+fn vendor_dir() -> Result<PathBuf> {
+    let out = std::env::var("CARGO_TARGET_OUT_DIR")
+        .or_else(|_| std::env::var("CARGO_TARGET_DIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("target"));
+    // CARGO_TARGET_OUT_DIR points at target/<profile>; go up one.
+    Ok(if out.ends_with("debug") || out.ends_with("release") {
+        out.parent().map(PathBuf::from).unwrap_or(out)
+    } else {
+        out
+    }
+    .join("vendor"))
+}
+
+/// Written after a successful install; its presence + field match gates
+/// re-download, and it doubles as the audit trail (url, hashes, contents note)
+/// for whatever sits in the cached directory.
+#[derive(Serialize, Deserialize)]
+struct Manifest {
+    url: String,
+    /// Pinned hash, or the hash computed on first fetch when unpinned.
+    sha256: Option<String>,
+    source_note: String,
+    platform: String,
+}
+
+impl Manifest {
+    fn load(root: &Path, name: &str) -> Option<Self> {
+        let raw = fs::read_to_string(root.join(name).join("manifest.json")).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+}
+
+enum Status {
+    Cached,
+    Missing,
+    Stale,
+    NotProvided,
+}
+
+fn install_status(root: &Path, art: &Artifact) -> Status {
+    if matches!(art.kind, ArtifactKind::NotProvided) {
+        return Status::NotProvided;
+    }
+    let Some(m) = Manifest::load(root, art.name) else {
+        return if root.join(art.name).exists() { Status::Stale } else { Status::Missing };
+    };
+    // url+platform must match the pins; a sha recorded in the manifest may be
+    // the computed one (unpinned platform), so only compare when pinned.
+    let fresh = m.platform == platform()
+        && m.url == art.url
+        && art.sha256.as_ref().is_none_or(|pin| m.sha256.as_deref() == Some(pin))
+        && root.join(art.name).exists();
+    if fresh {
+        Status::Cached
+    } else {
+        Status::Stale
+    }
+}
+
+fn download(url: &str) -> Result<Vec<u8>> {
+    let mut resp = ureq::get(url).call().with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        bail!("GET {url} -> HTTP {}", resp.status());
+    }
+    let mut buf = Vec::new();
+    resp.body_mut().as_reader().read_to_end(&mut buf).context("reading response body")?;
+    Ok(buf)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn verify_sha256(bytes: &[u8], want: &str) -> Result<()> {
+    let got = sha256_hex(bytes);
+    if !got.eq_ignore_ascii_case(want) {
+        bail!("sha256 mismatch: expected {want}, got {got}");
+    }
+    Ok(())
+}
+
+/// Unpack a .zip (Windows FFmpeg build, libclang wheel). When `strip_top`,
+/// drop the first path component (BtbN archives wrap contents in one dir).
+/// `only` keeps members whose path contains that substring; they are written
+/// relative to `dst` after stripping everything before the match.
+fn unpack_zip(bytes: &[u8], dst: &Path, strip_top: bool, only: Option<&str>) -> Result<()> {
+    let mut zr = zip::ZipArchive::new(Cursor::new(bytes)).context("opening zip")?;
+    for i in 0..zr.len() {
+        let mut entry = zr.by_index(i)?;
+        let raw = entry.name().to_string();
+        let rel = if strip_top {
+            match raw.split_once('/') {
+                Some((_, r)) if !r.is_empty() => r.to_string(),
+                _ => continue, // top-level dir entry itself, or nothing to strip
+            }
+        } else {
+            raw.clone()
+        };
+        if rel.is_empty() || entry.is_dir() {
+            continue;
+        }
+        let target = match only {
+            Some(f) => {
+                let idx = match rel.find(f) {
+                    Some(i) => i,
+                    None => continue,
+                };
+                dst.join(&rel[idx..])
+            }
+            None => dst.join(&rel),
+        };
+        if let Some(p) = target.parent() {
+            fs::create_dir_all(p)?;
+        }
+        let mut out = fs::File::create(&target)?;
+        std::io::copy(&mut entry, &mut out)?;
+    }
+    Ok(())
+}
+
+/// Unpack a .tar.xz (Linux FFmpeg builds) with the top dir stripped.
+fn unpack_tar_xz(bytes: &[u8], dst: &Path) -> Result<()> {
+    let mut tar_bytes = Vec::new();
+    lzma_rs::xz_decompress(&mut Cursor::new(bytes), &mut tar_bytes)
+        .map_err(|e| anyhow::anyhow!("xz decompress: {e:?}"))?;
+    let mut ar = tar::Archive::new(Cursor::new(tar_bytes));
+    for entry in ar.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let stripped = path.components().skip(1).collect::<PathBuf>();
+        let rel = match stripped.to_str() {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        let target = dst.join(rel);
+        if entry.header().entry_type().is_dir() {
+            fs::create_dir_all(target)?;
+            continue;
+        }
+        if let Some(p) = target.parent() {
+            fs::create_dir_all(p)?;
+        }
+        let mut out = fs::File::create(&target)?;
+        std::io::copy(&mut entry, &mut out)?;
+    }
+    Ok(())
+}
+
+fn note_for(name: &str) -> &'static str {
+    match name {
+        "ffmpeg" => "FFmpeg 7.1 shared build (BtbN): include/, lib/ (import libs), \
+                     bin/ (runtime DLLs). Consumed by ffmpeg-sys-next via FFMPEG_DIR \
+                     (.cargo/config.toml). Pinned 7.1: rust-ffmpeg 9.x rejects FFmpeg 8.",
+        "libclang" => "libclang.dll extracted from the libclang PyPI wheel; bindgen \
+                       (ffmpeg-sys-next build.rs) needs it via LIBCLANG_PATH.",
+        _ => "vendor toolchain",
+    }
+}
+
+fn install(root: &Path, art: &Artifact) -> Result<()> {
+    println!("downloading {} ...", art.url.rsplit('/').next().unwrap_or(""));
+    let bytes = download(&art.url)?;
+    let recorded_sha = match &art.sha256 {
+        Some(pin) => {
+            verify_sha256(&bytes, pin)?;
+            pin.clone()
+        }
+        None => {
+            let got = sha256_hex(&bytes);
+            println!("  note: unpinned artifact; recorded sha256 {got} in manifest.json");
+            got
+        }
+    };
+    let dir = root.join(art.name);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).ok();
+    }
+    fs::create_dir_all(&dir)?;
+    match art.kind {
+        ArtifactKind::ArchiveFlatten if art.url.ends_with(".zip") => {
+            unpack_zip(&bytes, &dir, true, None)?
+        }
+        ArtifactKind::ArchiveFlatten => unpack_tar_xz(&bytes, &dir)?,
+        ArtifactKind::LibclangDll => {
+            unpack_zip(&bytes, &dir, false, Some("native/libclang.dll"))?
+        }
+        ArtifactKind::NotProvided => unreachable!("install is never called for NotProvided"),
+    }
+    let manifest = Manifest {
+        url: art.url.clone(),
+        sha256: Some(recorded_sha),
+        source_note: note_for(art.name).into(),
+        platform: platform().into(),
+    };
+    fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)?.as_bytes(),
+    )?;
+    println!("  -> {}", dir.display());
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let root = vendor_dir()?;
+
+    match args.cmd {
+        Cmd::Status => {
+            let mut all_ready = true;
+            for art in artifacts() {
+                match install_status(&root, &art) {
+                    Status::Cached => println!("[cached]  {}", art.name),
+                    Status::Missing => {
+                        all_ready = false;
+                        println!("[missing] {}", art.name)
+                    }
+                    Status::Stale => {
+                        all_ready = false;
+                        println!("[stale]   {} (pins or platform changed)", art.name)
+                    }
+                    Status::NotProvided => println!(
+                        "[n/a]     {} ({} — see setup message)",
+                        art.name,
+                        platform()
+                    ),
+                }
+            }
+            println!(
+                "\n{}",
+                if all_ready { "ready: cargo build --features rtsp" } else { "run: cargo xtask setup" }
+            );
+            Ok(())
+        }
+        Cmd::Setup { force } => {
+            for art in artifacts() {
+                match install_status(&root, &art) {
+                    Status::Cached if !force => {
+                        println!("[cached] {} (pass --force to refetch)", art.name);
+                    }
+                    Status::NotProvided => {
+                        let hint = match art.name {
+                            "ffmpeg" => "brew install ffmpeg (or set FFMPEG_DIR yourself)",
+                            "libclang" => "apt install libclang-dev / brew install llvm; \
+                                           then export LIBCLANG_PATH accordingly",
+                            _ => "",
+                        };
+                        println!("skipping {} on {}: {hint}", art.name, platform());
+                    }
+                    _ => install(&root, &art)?,
+                }
+            }
+            println!("\nsetup complete. cargo build --features rtsp should now work.");
+            Ok(())
+        }
+    }
+}

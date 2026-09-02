@@ -1,0 +1,13 @@
+# Toolchain env for the `rtsp` feature (FFmpeg + libclang), populated into
+# target/vendor by `cargo xtask setup`. `relative` resolves against this
+# file's directory; `force = false` lets an externally-set value win.
+# cargo clean removes target/vendor, so setup is re-runnable and cheap.
+[env]
+FFMPEG_DIR = { value = "target/vendor/ffmpeg", relative = true, force = false }
+LIBCLANG_PATH = { value = "target/vendor/libclang/native", relative = true, force = false }
+# inherit = prepend, so cargo run finds FFmpeg's DLLs at runtime too
+# (build-time linking above is not enough; shared libs load via PATH).
+PATH = { value = "target/vendor/ffmpeg/bin", relative = true, inherit = true }
+
+[alias]
+xtask = "run --package xtask --"

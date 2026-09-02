@@ -40,13 +40,20 @@ Before ending a work session, make sure `@` has a meaningful description
 
 - Rust workspace, edition 2024 (rustc ≥ 1.85). `cargo check` / `cargo test`
   work with **no native deps** by default.
-- The `rtsp` feature of `item-ingest` requires `FFMPEG_DIR` (a vendored
-  FFmpeg **7.1** shared build — rust-ffmpeg 9.x rejects FFmpeg 8) and
-  `LIBCLANG_PATH` (libclang for bindgen). Exact setup: README section
-  "RTSP backend". Never assume a bare `cargo build --all-features` works
-  without those env vars.
-- `vendor/` (FFmpeg, libclang, mediamtx, test media) and `data/` (SQLite)
-  are git-ignored; don't commit them, don't delete them to "clean up".
+- The `rtsp` feature of `item-ingest` needs FFmpeg 7.1 + libclang. Setup is
+  automated: run `cargo xtask setup` (downloads verified archives into
+  `target/vendor/`), then `cargo build --features rtsp` — `.cargo/config.toml`
+  injects `FFMPEG_DIR`/`LIBCLANG_PATH`/runtime `PATH`, so agents must **not**
+  export these manually. `cargo xtask status` reports cache state.
+- Pinning policy: all artifact URLs + sha256s live in `crates/xtask/src/main.rs`
+  module `pins`. FFmpeg must stay on **7.1** (rust-ffmpeg 9.x rejects FFmpeg 8;
+  BtbN's rolling `latest` tag ships 8 — never pin it). Each `target/vendor/*`
+  dir carries a `manifest.json` recording url/sha/platform; a mismatch or
+  missing manifest means stale cache → `cargo xtask setup --force`.
+- `cargo clean` wipes the toolchain cache (it lives under `target/`); that is
+  by design, re-run setup after cleaning.
+- `vendor/` (dev-only test gear: mediamtx, test.mp4) and `data/` (SQLite) are
+  git-ignored; don't commit them, don't delete them to "clean up".
 
 ## Project conventions
 
