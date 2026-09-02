@@ -14,7 +14,8 @@ Three crates, one-way dependencies (`item-query`/`item-ingest` -> `item-core`):
   behind `--features rtsp`) -> `Detector` (Null now, YOLO-onnx
   behind `--features yolo` via ort) -> NMS -> zone mapping -> store. Also an
   axum webhook server that ingests Frigate events directly, skipping local
-  detection entirely.
+  detection entirely, plus an MJPEG web preview bridge for RTSP cameras
+  (`--preview`, feature `rtsp`).
 - **crates/item-query** — the read side. CLI (`log`, `ask`) over observations,
   with an OpenAI-compatible VLM client (llama.cpp/Ollama/cloud sidecar) used
   only when `ITEM_VLM_BASE_URL`/`ITEM_VLM_MODEL` are set. The Rust core never
@@ -28,6 +29,9 @@ cargo run -p item-ingest -- --demo
 
 # RTSP camera (one-time: `cargo xtask setup` to fetch FFmpeg + libclang)
 cargo run --features rtsp -p item-ingest -- --rtsp "rtsp://user:pass@192.168.1.50:554/Streaming/Channels/101" --camera-id living
+
+# live web preview (MJPEG bridge; browsers can't speak RTSP) — open http://<host>:8477/preview
+cargo run --features rtsp -p item-ingest -- --preview "rtsp://user:pass@192.168.1.50:554/Streaming/Channels/101"
 
 # webhook receiver (point Frigate event forwarding at POST /frigate/webhook)
 cargo run -p item-ingest -- --listen 127.0.0.1:8477
@@ -69,6 +73,16 @@ Dev-loop tip: `vendor/mediamtx.exe` + the vendored ffmpeg binary make a
 local RTSP test stream —
 `ffmpeg -re -stream_loop -1 -i test.mp4 -c copy -f rtsp -rtsp_transport tcp
 rtsp://127.0.0.1:8554/cam1`. Verified end to end: decode -> RGB8 -> store.
+
+### Web preview (`--preview <rtsp-url>`)
+
+Browsers can't consume RTSP, so the daemon bridges it: a background thread
+owns an `RtspSource` (with reconnect loop), JPEG-encodes at ~8 fps, and
+serves the frames to any browser as MJPEG (`multipart/x-mixed-replace`) —
+no JS, no external media server. Routes: `/preview` (page), `/preview.mjpg`
+(live), `/preview.jpg` (single frame). Same listener as the webhook; url
+credentials stay out of logs. LAN-only for now: anyone who can reach the
+port can watch (gate with a proxy/Tailscale before exposing beyond the LAN).
 
 ## Deliberate choices / non-goals (for now)
 

@@ -9,6 +9,8 @@
 
 pub mod detector;
 pub mod frigate;
+#[cfg(feature = "rtsp")]
+pub mod preview;
 pub mod source;
 
 use chrono::Utc;

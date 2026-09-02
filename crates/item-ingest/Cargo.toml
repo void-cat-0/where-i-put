@@ -38,6 +38,13 @@ features = ["input-native", "decoding"]
 version = "9"
 optional = true
 
+[dependencies.tokio-stream]
+version = "0.1"
+features = ["sync"]
+
+[dependencies.futures-util]
+version = "0.3"
+
 [features]
 default = []
 yolo = ["dep:ort"]

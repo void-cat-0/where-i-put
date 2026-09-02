@@ -42,6 +42,12 @@ struct Args {
     #[cfg(feature = "rtsp")]
     #[arg(long, default_value_t = 0)]
     frames: u64,
+
+    /// Serve a web MJPEG preview of this RTSP url at GET /preview
+    /// (requires `--features rtsp`). Credentials in the url are kept out of logs.
+    #[cfg(feature = "rtsp")]
+    #[arg(long)]
+    preview: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -69,6 +75,18 @@ fn main() -> anyhow::Result<()> {
 
     let state: item_ingest::frigate::State = Arc::new(Mutex::new(store));
     let app = item_ingest::frigate::router(state);
+
+    // Shadow (not mut): with `rtsp` off there is nothing to merge.
+    #[cfg(feature = "rtsp")]
+    let app = match args.preview.clone() {
+        Some(url) => {
+            // Credentials are part of the url; log only scheme+host.
+            tracing::info!(target_url = redact_url(&url), "web preview enabled at GET /preview");
+            app.merge(item_ingest::preview::router(item_ingest::preview::spawn_streamer(url)))
+        }
+        None => app,
+    };
+
     let addr: SocketAddr = args.listen.parse().context("bad --listen")?;
     tracing::info!(%addr, "frigate webhook server listening");
 
@@ -108,6 +126,19 @@ fn demo_pass(store: &Store) -> anyhow::Result<()> {
     let obs = store.recent(Some("keys"), 5)?;
     println!("demo observation: {:?}", obs.first().map(|o| (&o.zone, &o.label)));
     Ok(())
+}
+
+/// Strip credentials from an RTSP url for safe logging
+/// (rtsp://user:pass@host/path -> rtsp://host/path).
+#[cfg(feature = "rtsp")]
+fn redact_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => match rest.rsplit_once('@') {
+            Some((_, host_path)) => format!("{scheme}://{host_path}"),
+            None => url.to_string(),
+        },
+        None => url.to_string(),
+    }
 }
 
 /// Pull N frames from an RTSP camera through the NullDetector plumbing and log
