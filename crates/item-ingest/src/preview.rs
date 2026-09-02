@@ -31,10 +31,12 @@ use futures_util::stream::{StreamExt as _, TryStreamExt as _};
 
 use crate::source::{FrameSource, rtsp::RtspSource};
 
-/// Encoder settings for the preview feed. 8 fps is enough for a glance at a
-/// room and keeps CPU/bandwidth modest over home Wi-Fi.
-const TARGET_FPS: u64 = 8;
-const JPEG_QUALITY: u8 = 70;
+/// Encoder settings for the preview feed. 25 fps matches the camera
+/// substream (102) natively — anything lower reads as stutter next to the
+/// Hik client. Quality 60 keeps ~25fps at ~720p affordable CPU-wise and
+/// ~5-10 Mbps on the wire, which LAN Wi-Fi handles fine.
+const TARGET_FPS: u64 = 25;
+const JPEG_QUALITY: u8 = 60;
 
 pub type FrameTx = broadcast::Sender<Arc<[u8]>>;
 
@@ -45,23 +47,46 @@ pub fn spawn_streamer(url: String) -> FrameTx {
     let (tx, _rx) = broadcast::channel::<Arc<[u8]>>(2);
     let feed_tx = tx.clone();
     std::thread::spawn(move || {
-        let min_interval = Duration::from_millis(1000 / TARGET_FPS);
+        // Throttle by CREDIT, never by wall-clock: time gates quantize badly
+        // when source fps ~ target fps (a 93ms gate and a 1.5*src-interval
+        // gate both measured exactly half delivery — 25fps in, 12.5fps out —
+        // because frame arrivals are quantized to multiples of the source
+        // interval and land microseconds either side of a fixed threshold).
+        // Instead: estimate source fps via EWMA of arrival gaps, accrue
+        // TARGET_FPS/src_fps "credits" per decoded frame, emit when credit >=
+        // 1. A source at/below target accrues >= 1 per frame (every frame
+        // passes); faster ones average out to the target rate smoothly, with
+        // no modulo-phase jumps when the estimate jitters across a boundary.
+        let mut prev_arrival = Instant::now();
+        let mut src_interval = Duration::from_millis(40); // seed ~25fps
+        let mut credit = 1.0f64;
         loop {
             tracing::info!("preview: opening rtsp stream");
             match RtspSource::new("preview", &url) {
                 Ok(mut source) => {
-                    let mut last_emit = Instant::now() - min_interval;
                     loop {
                         match source.next_frame() {
                             Ok(frame) => {
-                                if last_emit.elapsed() < min_interval {
-                                    continue; // drop extra frames, decode only
+                                let now = Instant::now();
+                                // EWMA the source interval (1/4 weight).
+                                let gap = now
+                                    .saturating_duration_since(prev_arrival)
+                                    .min(Duration::from_secs(1));
+                                src_interval = (src_interval * 3 + gap) / 4;
+                                prev_arrival = now;
+                                // Accrue target-frames-worth of credit for
+                                // this one source frame, emit when >= 1.
+                                let src_fps =
+                                    1_000_000_000u64 / src_interval.as_nanos().max(1) as u64;
+                                credit += TARGET_FPS as f64 / src_fps.max(1) as f64;
+                                if credit < 1.0 {
+                                    continue; // skipped, decoded only
                                 }
+                                credit -= 1.0;
                                 match encode_jpeg(&frame.rgb, frame.meta.width, frame.meta.height) {
                                     Ok(jpeg) => {
                                         // Err only when nobody is listening.
                                         let _ = feed_tx.send(Arc::from(jpeg));
-                                        last_emit = Instant::now();
                                     }
                                     Err(e) => tracing::warn!(error = %e, "preview: jpeg encode"),
                                 }

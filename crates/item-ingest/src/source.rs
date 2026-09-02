@@ -156,12 +156,19 @@ pub mod rtsp {
                         SourceError::Capture("rtsp stream has no video".into())
                     })?;
                 let video_index = stream.index();
-                let decoder =
+                let mut context =
                     ffmpeg::codec::context::Context::from_parameters(stream.parameters())
-                        .map_err(err)?
-                        .decoder()
-                        .video()
                         .map_err(err)?;
+                // HEVC software decode is frame-heavy; rust-ffmpeg defaults to a
+                // single decoder thread (ffmpeg CLI picks "auto"). 4 threads
+                // brought 720p25 preview from ~13 fps to full rate on an
+                // 8-core machine.
+                context.set_threading(ffmpeg::codec::threading::Config {
+                    kind: ffmpeg::codec::threading::Type::Frame,
+                    count: 4,
+                    ..Default::default()
+                });
+                let decoder = context.decoder().video().map_err(err)?;
                 let scaler = ffmpeg::software::scaling::context::Context::get(
                     decoder.format(),
                     decoder.width(),
