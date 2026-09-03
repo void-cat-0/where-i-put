@@ -13,8 +13,8 @@ Three crates, one-way dependencies (`item-query`/`item-ingest` -> `item-core`):
   last_seen]", merged while sightings stay within a 5-min dedup window.
 - **crates/item-ingest** — the write side. `FrameSource` (Mock now, nokhwa
   for USB webcams behind `--features camera`, ffmpeg-next for RTSP/IP cameras
-  behind `--features rtsp`) -> `Detector` (Null now, YOLO-onnx
-  behind `--features yolo` via ort) -> NMS -> zone mapping -> store. Also an
+  behind `--features rtsp`) -> `Detector` (Null without features; real
+  YOLOv8-onnx behind `--features yolo` via ort) -> NMS -> zone mapping -> store. Also an
   axum webhook server that ingests Frigate events directly, skipping local
   detection entirely, plus an MJPEG web preview bridge for RTSP cameras
   (`--preview`, feature `rtsp`).
@@ -37,6 +37,20 @@ cargo run --features rtsp -p item-ingest -- --preview "rtsp://user:pass@192.168.
 
 # object detection on one image (needs a local models/yolov8n.onnx, see below)
 cargo run --features yolo -p item-ingest -- --detect path/to/photo.jpg
+
+# THE CLOSED LOOP: camera -> throttled YOLO -> zone-mapped observations + snapshots
+cat > config.toml <<'EOF'
+[[camera]]
+id = "living"
+url = "rtsp://user:pass@192.168.1.64:554/Streaming/Channels/102"
+[camera.regions]                      # rects in camera pixels
+desk = [0.0, 360.0, 1280.0, 720.0]
+EOF
+cargo run --features "rtsp,yolo" -p item-ingest -- \
+    --rtsp "rtsp://user:pass@192.168.1.64:554/Streaming/Channels/102" \
+    --camera-id living --config config.toml --detect-fps 1
+cargo run -p item-query -- log            # what was seen where
+cargo run -p item-query -- ask "where is the cup"
 
 # webhook receiver (point Frigate event forwarding at POST /frigate/webhook)
 cargo run -p item-ingest -- --listen 127.0.0.1:8477
@@ -136,4 +150,11 @@ port can watch (gate with a proxy/Tailscale before exposing beyond the LAN).
   (`/models` is git-ignored); drop any stock Ultralytics YOLOv8/11 ONNX
   export (opset ≤ 17) at `models/yolov8n.onnx`. Beware hobby exports with
   custom preprocessing nodes (e.g. HzPreprocess) — ort can't run them.
-- Snapshot storage keeps references (frigate://...), never copies pixels yet.
+- Snapshots: the closed loop writes one representative JPEG per NEW
+  observation (`{snapshot-dir}/{id}.jpg`, attached via `set_sample_snapshot`);
+  the Frigate webhook path keeps storing `frigate://` refs instead.
+- Detection runs at `--detect-fps` (default 1; 720p CPU inference measured
+  ~280ms/frame at quality 60) while decode runs at stream rate; a person
+  lingering in one zone yields ONE merged observation with a hit count, not
+  per-frame rows. COCO-only for now: everyday objects like keys need the
+  future VLM-grounding detector (same `Detector` trait, sidecar HTTP).

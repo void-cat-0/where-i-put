@@ -1,8 +1,10 @@
-//! item-ingest daemon: receives Frigate webhooks and (with features) polls a
-//! local camera through MockSource/YoloDetector. Both paths converge on
+//! item-ingest daemon: receives Frigate webhooks, and (with features) runs a
+//! camera loop -- RTSP pull -> throttled YOLO detect -> zone-mapped
+//! observations + representative snapshots. All paths converge on
 //! item_ingest::ingest_detections / Store::record_sighting.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -19,9 +21,18 @@ struct Args {
     #[arg(long, default_value = "data/items.db")]
     db: String,
 
+    /// Camera/region config (TOML); regions are seeded into the store at
+    /// startup on every mode. See item_ingest::config.
+    #[arg(long)]
+    config: Option<String>,
+
     /// Address for the Frigate webhook server.
     #[arg(long, default_value = "127.0.0.1:8477")]
     listen: String,
+
+    /// Directory for observation snapshot JPEGs.
+    #[arg(long, default_value = "data/snapshots")]
+    snapshots_dir: String,
 
     /// Run a mock camera pass (blank frames through the pipeline) and exit.
     #[arg(long)]
@@ -43,6 +54,12 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     frames: u64,
 
+    /// How often to run detection on the stream (decode runs at stream rate;
+    /// only detected frames can create observations/snapshots).
+    #[cfg(feature = "rtsp")]
+    #[arg(long, default_value_t = 1.0)]
+    detect_fps: f64,
+
     /// Serve a web MJPEG preview of this RTSP url at GET /preview
     /// (requires `--features rtsp`). Credentials in the url are kept out of logs.
     #[cfg(feature = "rtsp")]
@@ -55,7 +72,7 @@ struct Args {
     #[arg(long)]
     detect: Option<String>,
 
-    /// Model path for --detect (yolov8n/yolo11n export, dynamic or 640 input).
+    /// Model path for detection (yolov8n/yolo11n export, dynamic or 640 input).
     #[cfg(feature = "yolo")]
     #[arg(long, default_value = "models/yolov8n.onnx")]
     model: String,
@@ -65,7 +82,7 @@ struct Args {
     #[arg(long, default_value_t = 640)]
     input_size: usize,
 
-    /// Confidence floor for --detect.
+    /// Confidence floor for detection (both --detect and the camera loop).
     #[cfg(feature = "yolo")]
     #[arg(long, default_value_t = 0.3)]
     conf: f32,
@@ -82,10 +99,20 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    if let Some(dir) = std::path::Path::new(&args.db).parent() {
+    if let Some(dir) = Path::new(&args.db).parent() {
         std::fs::create_dir_all(dir).ok();
     }
     let store = Store::open(&args.db).context("opening sqlite store")?;
+
+    if let Some(path) = args.config.as_deref() {
+        let cfg = item_ingest::config::Config::load(Path::new(path))?;
+        let n = cfg.seed_regions(&store)?;
+        tracing::info!(
+            cameras = cfg.camera.len(),
+            regions = n,
+            "config regions seeded"
+        );
+    }
 
     if args.demo {
         return demo_pass(&store);
@@ -98,7 +125,7 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "rtsp")]
     if let Some(url) = args.rtsp.as_deref() {
-        return rtsp_pass(&store, &args.camera_id, url, args.frames);
+        return rtsp_pass(&store, &args, url);
     }
 
     let state: item_ingest::frigate::State = Arc::new(Mutex::new(store));
@@ -133,6 +160,33 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
+/// The detector for the camera loop: real YOLO when built with `yolo`,
+/// otherwise Null (pipeline still exercises, but records nothing).
+#[cfg(all(feature = "rtsp", feature = "yolo"))]
+fn build_detector(args: &Args) -> anyhow::Result<Box<dyn Detector>> {
+    use item_ingest::detector::COCO_LABELS;
+    use item_ingest::detector::yolo::YoloDetector;
+
+    let det = YoloDetector::new(
+        Path::new(&args.model),
+        COCO_LABELS.iter().map(|s| s.to_string()).collect(),
+        args.input_size,
+        args.conf,
+    )
+    .map_err(|e| anyhow::anyhow!("model load: {e}"))?;
+    tracing::info!(model = %args.model, conf = args.conf, "yolo detector enabled");
+    Ok(Box::new(det))
+}
+
+#[cfg(all(feature = "rtsp", not(feature = "yolo")))]
+fn build_detector(_args: &Args) -> anyhow::Result<Box<dyn Detector>> {
+    tracing::warn!(
+        "built without 'yolo' feature: camera loop runs NullDetector (no observations); \
+         rebuild with --features yolo"
+    );
+    Ok(Box::new(NullDetector))
+}
+
 /// End-to-end smoke of the local pipeline without hardware or Frigate:
 /// blank frames -> NullDetector -> (zero sightings) -> store stays writable.
 fn demo_pass(store: &Store) -> anyhow::Result<()> {
@@ -145,7 +199,7 @@ fn demo_pass(store: &Store) -> anyhow::Result<()> {
             Err(e) => return Err(e.into()),
         };
         let dets = detector.detect(&frame.rgb, frame.meta.width, frame.meta.height)?;
-        let n = item_ingest::ingest_detections(store, &frame.meta, &dets, 0.5, 0.25)?;
+        let n = item_ingest::ingest_detections(store, &frame.meta, &dets, 0.5, 0.25, None)?;
         tracing::info!(recorded = n, "demo frame processed");
     }
     // Prove the zone mapping and dedup round-trip.
@@ -190,8 +244,8 @@ fn detect_pass(
 ) -> anyhow::Result<()> {
     use std::time::Instant;
 
+    use item_ingest::detector::COCO_LABELS;
     use item_ingest::detector::yolo::YoloDetector;
-    use item_ingest::detector::{COCO_LABELS, Detector};
 
     let img = image::open(img_path)
         .with_context(|| format!("opening {}", img_path))?
@@ -199,7 +253,7 @@ fn detect_pass(
     let (w, h) = img.dimensions();
     let started = Instant::now();
     let det = YoloDetector::new(
-        std::path::Path::new(model_path),
+        Path::new(model_path),
         COCO_LABELS.iter().map(|s| s.to_string()).collect(),
         input_size,
         conf,
@@ -235,42 +289,72 @@ fn detect_pass(
     Ok(())
 }
 
-/// Pull N frames from an RTSP camera through the NullDetector plumbing and log
-/// them; proves decode -> Frame -> (empty detections) -> store. The real
-/// detector swaps in once the `yolo` feature is verified against ort 2.0.
+/// The closed loop: RTSP frames are decoded continuously (and cheaply
+/// dropped), detection runs at --detect-fps, surviving hits become zone-
+/// mapped observations whose first sighting gets a snapshot JPEG. Reconnects
+/// forever, like preview does.
 #[cfg(feature = "rtsp")]
-fn rtsp_pass(store: &Store, camera_id: &str, url: &str, max_frames: u64) -> anyhow::Result<()> {
+fn rtsp_pass(store: &Store, args: &Args, url: &str) -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+
     use item_ingest::source::rtsp::RtspSource;
 
-    let mut source =
-        RtspSource::new(camera_id, url).map_err(|e| anyhow::anyhow!("rtsp connect failed: {e}"))?;
-    let detector = NullDetector;
-    let mut n = 0u64;
+    let detector = build_detector(args)?;
+    let snaps = std::path::PathBuf::from(&args.snapshots_dir);
+    let interval = Duration::from_secs_f64(1.0 / args.detect_fps.max(0.05));
+    let mut last_detect = Instant::now() - interval;
+    let mut frames = 0u64;
+    let mut detected = 0u64;
     loop {
-        if max_frames > 0 && n >= max_frames {
-            break;
-        }
-        let frame = match source.next_frame() {
-            Ok(f) => f,
-            Err(SourceError::Eof) => {
-                tracing::info!("rtsp stream ended");
-                break;
+        tracing::info!(target_url = redact_url(url), "opening rtsp stream");
+        let mut source = match RtspSource::new(&args.camera_id, url) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "connect failed, retrying in 2s");
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
             }
-            Err(e) => return Err(anyhow::anyhow!("rtsp read failed after {n} frames: {e}")),
         };
-        let dets = detector.detect(&frame.rgb, frame.meta.width, frame.meta.height)?;
-        item_ingest::ingest_detections(store, &frame.meta, &dets, 0.5, 0.25)?;
-        n += 1;
-        if n % 30 == 1 {
-            tracing::info!(
-                frames = n,
-                w = frame.meta.width,
-                h = frame.meta.height,
-                bytes = frame.rgb.len(),
-                "rtsp frames flowing"
-            );
+        loop {
+            if args.frames > 0 && frames >= args.frames {
+                println!(
+                    "ingested {frames} rtsp frames ({detected} detections) from {}",
+                    args.camera_id
+                );
+                return Ok(());
+            }
+            let frame = match source.next_frame() {
+                Ok(f) => f,
+                Err(SourceError::Eof) => {
+                    tracing::info!("stream ended, reconnecting");
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "stream error, reconnecting");
+                    break;
+                }
+            };
+            frames += 1;
+            if last_detect.elapsed() < interval {
+                continue; // decode-only frame, throttle detection
+            }
+            last_detect = Instant::now();
+            let dets = detector
+                .detect(&frame.rgb, frame.meta.width, frame.meta.height)
+                .map_err(|e| anyhow::anyhow!("inference: {e}"))?;
+            detected += 1;
+            let recorded = item_ingest::ingest_detections(
+                store,
+                &frame.meta,
+                &dets,
+                0.45,
+                0.0, // detector already floors at conf
+                Some((&frame.rgb, snaps.as_path())),
+            )?;
+            if recorded > 0 {
+                tracing::info!(frames, recorded, "detections ingested");
+            }
         }
+        std::thread::sleep(Duration::from_secs(2));
     }
-    println!("ingested {n} rtsp frames from {camera_id}");
-    Ok(())
 }

@@ -87,6 +87,7 @@ pub async fn webhook(
         snapshot.as_deref(),
         item_core::store::DEFAULT_DEDUP_WINDOW,
     ) {
+        // webhooks carry no pixels; the (id, is_new) tuple is not used here
         Ok(_) => axum::http::StatusCode::OK,
         Err(e) => {
             tracing::error!(error = %e, "failed to persist frigate event");
