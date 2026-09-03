@@ -48,8 +48,14 @@ Before ending a work session, make sure `@` has a meaningful description
 - Pinning policy: all artifact URLs + sha256s live in `crates/xtask/src/main.rs`
   module `pins`. FFmpeg must stay on **7.1** (rust-ffmpeg 9.x rejects FFmpeg 8;
   BtbN's rolling `latest` tag ships 8 — never pin it). Each `target/vendor/*`
-  dir carries a `manifest.json` recording url/sha/platform; a mismatch or
-  missing manifest means stale cache → `cargo xtask setup --force`.
+  dir carries a `manifest.json` recording url/sha/platform (plus flavor
+  zip|source); a mismatch or missing manifest means stale cache →
+  `cargo xtask setup [--force]`.
+- `cargo xtask setup --from-source` builds the pinned upstream FFmpeg tarball
+  (configure whitelist: rtsp/tcp/udp + h264/hevc/mjpeg only) into the same
+  `target/vendor/ffmpeg` layout. Requires sh/perl/make/nasm (+ cl.exe via MSVC
+  Developer shell on Windows) — on this Windows dev machine `make` is absent,
+  so the preflight fails with guidance; treat that as the designed behavior.
 - `cargo clean` wipes the toolchain cache (it lives under `target/`); that is
   by design, re-run setup after cleaning.
 - `vendor/` (dev-only test gear: mediamtx, test.mp4) and `data/` (SQLite) are

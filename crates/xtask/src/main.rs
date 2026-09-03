@@ -42,6 +42,13 @@ mod pins {
     // NOT the extracted libclang.dll.
     pub const LIBCLANG_WIN_SHA: &str =
         "4dd2d3b82fab35e2bf9ca717d7b63ac990a3519c7e312f19fa8e86dcc712f7fb";
+    /// Upstream FFmpeg release for `setup --from-source` (the only route to a
+    /// FFmpeg of our own choosing on macOS, and to byte-reproducible
+    /// artifacts in CI). sha256 computed from the downloaded tarball on
+    /// 2026-09-03; cross-check against ffmpeg.org's release MD5/GPG if paranoid.
+    pub const SRC_URL: &str = "https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz";
+    pub const SRC_SHA: &str =
+        "de668509caf9e35e3cd162473441fdb29538c6d96ed080292b3cf9e6fc5d558f";
 }
 
 fn platform() -> &'static str {
@@ -119,6 +126,12 @@ enum Cmd {
         /// Refetch even when the cache matches the pins.
         #[arg(long)]
         force: bool,
+        /// Build FFmpeg 7.1.5 from upstream source into target/vendor/
+        /// ffmpeg-static/ instead of using the prebuilt zip. Needs a POSIX
+        /// build environment (sh, make, nasm; MSVC inside a Developer
+        /// shell on Windows). Minutes, not seconds.
+        #[arg(long)]
+        from_source: bool,
     },
     /// Report which artifacts are cached vs. missing/stale.
     Status,
@@ -149,6 +162,10 @@ struct Manifest {
     sha256: Option<String>,
     source_note: String,
     platform: String,
+    /// "zip" (default, prebuilt) or "source" (built by setup --from-source).
+    /// Old manifests without the field load as "zip" via serde default.
+    #[serde(default)]
+    flavor: String,
 }
 
 impl Manifest {
@@ -173,11 +190,20 @@ fn install_status(root: &Path, art: &Artifact) -> Status {
         return if root.join(art.name).exists() { Status::Stale } else { Status::Missing };
     };
     // url+platform must match the pins; a sha recorded in the manifest may be
-    // the computed one (unpinned platform), so only compare when pinned.
-    let fresh = m.platform == platform()
-        && m.url == art.url
-        && art.sha256.as_ref().is_none_or(|pin| m.sha256.as_deref() == Some(pin))
-        && root.join(art.name).exists();
+    // the computed one (unpinned platform), so only compare when pinned. A
+    // "source" install has a different identity: pinned upstream tarball built
+    // locally, recognized independently of the zip artifact url.
+    let fresh = if m.flavor == "source" {
+        m.platform == platform()
+            && m.url == pins::SRC_URL
+            && m.sha256.as_deref() == Some(pins::SRC_SHA)
+            && root.join(art.name).join("include").exists()
+    } else {
+        m.platform == platform()
+            && m.url == art.url
+            && art.sha256.as_ref().is_none_or(|pin| m.sha256.as_deref() == Some(pin))
+            && root.join(art.name).exists()
+    };
     if fresh {
         Status::Cached
     } else {
@@ -285,6 +311,156 @@ fn note_for(name: &str) -> &'static str {
     }
 }
 
+/// Minimal toolchain required to build FFmpeg from source: its ./configure is
+/// a POSIX shell script (needs sh + perl), the build needs make, x86 asm
+/// needs nasm. Probe without assuming --version flags work uniformly.
+fn probe(cmd: &str, args: &[&str]) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn require_build_tools() -> Result<()> {
+    let mut missing: Vec<(&str, &str)> = Vec::new();
+    if !probe("sh", &["-c", "true"]) {
+        missing.push(("sh", "Windows: Git Bash (already typical) or MSYS2"));
+    }
+    if !probe("perl", &["--version"]) {
+        missing.push(("perl", "configure is a perl-driven script; Git Bash ships perl; MSYS2: pacman -S perl"));
+    }
+    if !probe("make", &["--version"]) {
+        missing.push(("make", "Windows: MSYS2 `pacman -S make` (Git Bash does NOT ship make); Linux: build-essential; macOS: CLT"));
+    }
+    if !probe("nasm", &["-v"]) {
+        missing.push(("nasm", "x86 asm backend; MSYS2: pacman -S nasm; Linux: apt install nasm; macOS: brew install nasm"));
+    }
+    if !missing.is_empty() {
+        let mut msg = String::from(
+            "FFmpeg from-source needs a POSIX build environment; missing:\n",
+        );
+        for (tool, hint) in &missing {
+            msg.push_str(&format!("  - {tool}: {hint}\n"));
+        }
+        msg.push_str(
+            "On Windows also run from an MSVC Developer shell (cl.exe on PATH),\n\
+             or skip all of this: the default `cargo xtask setup` (no flags)\n\
+             fetches the prebuilt zip instead.",
+        );
+        bail!(msg);
+    }
+    Ok(())
+}
+
+/// Components we actually use (RTSP pull -> H.264/HEVC decode -> swscale
+/// RGB), mirroring prpr-avc-ffmpeg's `--disable-everything` + whitelist shape,
+/// minus their Hz custom op and plus the live-streaming stack they don't need.
+/// We build SHARED deliberately: it keeps the FFMPEG_DIR contract identical to
+/// the zip path (include/ + lib/ import libs + bin/ DLLs), so build.rs DLL
+/// staging and ffmpeg-sys-next's default dynamic linking both keep working
+/// with no extra cargo features. (A `--static` output mode would need the
+/// matching static feature on ffmpeg-next — wire that up in CI later.)
+const SRC_CONFIGURE: &[&str] = &[
+    "--disable-everything",
+    "--disable-programs",
+    "--disable-doc",
+    "--disable-debug",
+    "--disable-autodetect",
+    "--enable-shared",
+    "--enable-swscale",
+    "--enable-swresample",
+    "--enable-network",
+    // decoders: video we ingest + mjpeg (prebuilt-zip compat)
+    "--enable-decoder=h264,hevc,mjpeg",
+    "--enable-demuxer=rtsp,rtp,mpegts,sdp,h264,hevc",
+    "--enable-parser=h264,hevc,mpeg4video,mpegaudio,ac3",
+    "--enable-protocol=rtsp,tcp,udp,rtp,file",
+    "--enable-filter=scale",
+];
+
+/// Build FFmpeg from the pinned upstream tarball into target/vendor/ffmpeg/
+/// (the canonical FFMPEG_DIR; this intentionally replaces a zip install —
+/// `setup` without the flag restores the zip). Several minutes: configure's
+/// self-tests dominate, then make.
+fn build_from_source(root: &Path) -> Result<()> {
+    require_build_tools()?;
+
+    println!("downloading FFmpeg source (pinned {})", pins::SRC_URL);
+    let bytes = download(pins::SRC_URL)?;
+    verify_sha256(&bytes, pins::SRC_SHA)?;
+
+    let src = root.join("ffmpeg-src");
+    if src.exists() {
+        fs::remove_dir_all(&src).ok();
+    }
+    fs::create_dir_all(&src)?;
+    unpack_tar_xz(&bytes, &src)?;
+
+    let prefix = root.join("ffmpeg");
+    if prefix.exists() {
+        // full replace keeps the artifact reproducible from the pinned tarball
+        fs::remove_dir_all(&prefix).ok();
+    }
+    fs::create_dir_all(&prefix)?;
+
+    // FFmpeg's configure writes into the source tree and installs to a
+    // prefix; on Windows it wants forward slashes for the --prefix path.
+    let mut cfg_args: Vec<String> = SRC_CONFIGURE.iter().map(|s| s.to_string()).collect();
+    cfg_args.push(format!("--prefix={}", prefix.display().to_string().replace('\\', "/")));
+    if cfg!(windows) {
+        cfg_args.push("--toolchain=msvc".into());
+    }
+
+    let jobs = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .to_string();
+    // configure is an extensionless shell script; `sh -c 'exec ... "$@"'`
+    // forwards args without quoting hazards (prefix may contain spaces).
+    let mut cargs: Vec<&str> = vec!["-c", "exec ./configure \"$@\"", "configure"];
+    cargs.extend(cfg_args.iter().map(|s| s.as_str()));
+    run("sh", &cargs, Some(&src), "configure")?;
+    run("make", &["-j", &jobs], Some(&src), "make")?;
+    run("make", &["install"], Some(&src), "make install")?;
+
+    let manifest = Manifest {
+        url: pins::SRC_URL.into(),
+        sha256: Some(pins::SRC_SHA.into()),
+        source_note: format!(
+            "FFmpeg 7.1.5 built FROM SOURCE via `cargo xtask setup --from-source`; \
+             shared libs + DLLs, same layout as the zip install; configure flags: {:?}",
+            SRC_CONFIGURE
+        ),
+        platform: platform().into(),
+        flavor: "source".into(),
+    };
+    fs::write(
+        prefix.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)?.as_bytes(),
+    )?;
+    fs::remove_dir_all(&src).ok(); // ~300MB of sources; the artifact is the point
+    println!("from-source complete -> {}", prefix.display());
+    Ok(())
+}
+
+fn run(program: &str, args: &[&str], cwd: Option<&Path>, label: &str) -> Result<()> {
+    println!("  {label}: {program} {}...", args.join(" "));
+    let mut cmd = std::process::Command::new(program);
+    if let Some(c) = cwd {
+        cmd.current_dir(c);
+    }
+    cmd.args(args);
+    let status = cmd
+        .status()
+        .with_context(|| format!("spawn {label}: {program}"))?;
+    if !status.success() {
+        bail!("{label} failed (exit {:?}); see output above", status.code());
+    }
+    Ok(())
+}
+
 fn install(root: &Path, art: &Artifact) -> Result<()> {
     println!("downloading {} ...", art.url.rsplit('/').next().unwrap_or(""));
     let bytes = download(&art.url)?;
@@ -319,6 +495,7 @@ fn install(root: &Path, art: &Artifact) -> Result<()> {
         sha256: Some(recorded_sha),
         source_note: note_for(art.name).into(),
         platform: platform().into(),
+        flavor: "zip".into(),
     };
     fs::write(
         dir.join("manifest.json"),
@@ -359,7 +536,30 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Setup { force } => {
+        Cmd::Setup { force, from_source } => {
+            if from_source {
+                build_from_source(&root)?;
+                // libclang (or system llvm) is still needed for bindgen.
+                for art in artifacts() {
+                    if art.name != "libclang" {
+                        continue;
+                    }
+                    match install_status(&root, &art) {
+                        Status::Cached if !force => {
+                            println!("[cached] libclang (pass --force to refetch)")
+                        }
+                        Status::NotProvided => println!(
+                            "libclang: using system LLVM on {} (export LIBCLANG_PATH if not on default search path)",
+                            platform()
+                        ),
+                        _ => install(&root, &art)?,
+                    }
+                }
+                println!("\nfrom-source setup complete: FFMPEG_DIR is a locally built \
+                          shared tree (same layout as the zip; run `cargo xtask setup` \
+                          without the flag to restore the prebuilt zip).");
+                return Ok(());
+            }
             for art in artifacts() {
                 match install_status(&root, &art) {
                     Status::Cached if !force => {

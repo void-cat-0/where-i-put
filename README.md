@@ -68,6 +68,23 @@ Linux works the same way; macOS has no BtbN build — use `brew install
 ffmpeg` + system LLVM (setup prints hints, and externally-set
 `FFMPEG_DIR`/`LIBCLANG_PATH` win over config.toml).
 
+### Building FFmpeg from source: `cargo xtask setup --from-source`
+
+Alternative to the prebuilt zip: downloads the pinned upstream tarball
+(FFmpeg 7.1.5, sha256-checked), then `./configure` with a minimal whitelist
+(`--disable-everything` + only rtsp/tcp/udp, h264/hevc/mjpeg decode, swscale)
+and `make -j` into `target/vendor/ffmpeg/` — same include/lib/bin layout and
+FFMPEG_DIR contract as the zip, so everything downstream is identical.
+Manifest records flavor `source`; `setup` (no flag) restores the zip.
+Why bother: the only first-class route for macOS (BtbN doesn't ship it),
+byte-reproducible CI artifacts, and trimming features to our use.
+
+The local build needs a POSIX toolchain — `sh` + `perl` + `make` + `nasm`,
+and `cl.exe` on PATH on Windows (run from an MSVC Developer prompt, or use
+MSYS2 which provides the rest). Preflight reports exactly what's missing;
+minutes-scale, not seconds. The zip path remains the default precisely to
+avoid this — use `--from-source` in CI or on Linux/macOS.
+
 Version warning: rust-ffmpeg 9.x supports FFmpeg ≤ 7.x. BtbN's rolling
 `latest` tag is FFmpeg 8 (`avcodec-63.dll`) and the sys crate's probe
 rejects it — stay on the pinned 7.1 asset.
