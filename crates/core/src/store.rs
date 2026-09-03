@@ -43,6 +43,14 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// Open an existing database strictly read-only (no migrate, no WAL
+    /// change) -- the web server reads the loop's data while the ingest
+    /// daemon writes it; SQLite WAL makes concurrent readers safe.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { conn })
+    }
+
     fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS regions (
@@ -167,6 +175,20 @@ impl Store {
             params![id, path],
         )?;
         Ok(())
+    }
+
+    /// The stored snapshot path of one observation, if any. The web layer
+    /// resolves it to a file; `frigate://` refs come back verbatim.
+    pub fn snapshot_path(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT sample_snapshot FROM observations WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten())
     }
 
     /// Most recent observations, optionally filtered by a label substring

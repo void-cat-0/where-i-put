@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/item-ingest", "crates/item-query", "crates/xtask"]
+members = ["crates/core", "crates/item-ingest", "crates/item-query", "crates/xtask", "crates/item-web"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,12 +8,13 @@ edition = "2024"
 
 [workspace.dependencies]
 item-core = { path = "crates/core" }
+item-query = { path = "crates/item-query" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 rusqlite = { version = "0.40", features = ["bundled"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "fs"] }
 axum = "0.8"
 reqwest = { version = "0.13", features = ["json"] }
 clap = { version = "4", features = ["derive"] }

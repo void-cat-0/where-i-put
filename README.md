@@ -5,7 +5,8 @@
 Vision-based item memory: watch cameras (or a Frigate NVR's events), remember
 where objects were last seen, answer "where are my keys?".
 
-Three crates, one-way dependencies (`item-query`/`item-ingest` -> `item-core`):
+Crates, one-way dependencies (`item-ingest`/`item-query`/`item-web` -> `item-core`;
+`item-web` also reuses `item-query`'s prompt+VLM client):
 
 - **crates/core (`item-core`)** — domain model (`Detection`, `Observation`,
   `Region`), box geometry (IoU, greedy NMS), SQLite storage. The unit of truth
@@ -22,6 +23,13 @@ Three crates, one-way dependencies (`item-query`/`item-ingest` -> `item-core`):
   with an OpenAI-compatible VLM client (llama.cpp/Ollama/cloud sidecar) used
   only when `ITEM_VLM_BASE_URL`/`ITEM_VLM_MODEL` are set. The Rust core never
   embeds a VLM.
+- **crates/item-web** — the display side. Read-only web UI (binds 127.0.0.1:8478
+  by default): one binary serving a zero-build vanilla-JS card grid (snapshot,
+  zone/camera chips, hit count, relative time; live-search filter; ask bar that
+  answers from the log or via the VLM sidecar when configured; click-to-zoom
+  snapshot modal; 10 s auto-refresh) plus a small JSON API (`/api/observations`,
+  `/api/observation/{id}/snapshot`, `/api/ask`). Opens the same SQLite WAL file
+  the daemon writes, read-only — no write path, no contention, no shared process.
 
 ## Quick start
 
@@ -52,12 +60,14 @@ cargo run --features "rtsp,yolo" -p item-ingest -- \
 cargo run -p item-query -- log            # what was seen where
 cargo run -p item-query -- ask "where is the cup"
 
+# THE WEB UI (read-only; open http://127.0.0.1:8478 while the loop's db exists)
+cargo run -p item-web -- --db data/closed-loop.db
+# with a VLM sidecar running, `ask` answers in sentences instead of raw log
+# rows (works for item-web's ask bar too):
+ITEM_VLM_BASE_URL=http://127.0.0.1:8080/v1 ITEM_VLM_MODEL=qwen2.5vl cargo run -p item-web
+
 # webhook receiver (point Frigate event forwarding at POST /frigate/webhook)
 cargo run -p item-ingest -- --listen 127.0.0.1:8477
-
-# ask
-cargo run -p item-query -- log keys
-ITEM_VLM_BASE_URL=http://127.0.0.1:8080/v1 ITEM_VLM_MODEL=qwen2.5vl cargo run -p item-query -- ask "where are my keys"
 ```
 
 ## RTSP backend (`--features rtsp`)
