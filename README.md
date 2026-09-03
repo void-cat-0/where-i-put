@@ -1,5 +1,7 @@
 # where-i-put
 
+[![CI](https://github.com/void-cat-0/where-i-put/actions/workflows/ci.yml/badge.svg)](https://github.com/void-cat-0/where-i-put/actions/workflows/ci.yml)
+
 Vision-based item memory: watch cameras (or a Frigate NVR's events), remember
 where objects were last seen, answer "where are my keys?".
 
@@ -84,6 +86,23 @@ and `cl.exe` on PATH on Windows (run from an MSVC Developer prompt, or use
 MSYS2 which provides the rest). Preflight reports exactly what's missing;
 minutes-scale, not seconds. The zip path remains the default precisely to
 avoid this — use `--from-source` in CI or on Linux/macOS.
+
+Verified in CI: the `rtsp-source` job (ubuntu) runs the full loop —
+configure, make (~6 min), cargo test against the produced tree. Windows
+and macOS source builds are deliberately not in the matrix yet (Windows
+needs a proven cl.exe-in-MSYS2-sh handshake; macOS wants brew-llvm
+pathing and has no zip fallback anyway). Layout note: a source install
+puts `.so` files under `lib/` with no `bin/` (the zip ships `bin/*.dll`
+for Windows); on Linux runtime resolution goes through the baked rpath,
+so item-ingest's build.rs DLL staging is a silent no-op there.
+
+Gotchas discovered during CI bring-up, kept in `xtask` so you don't
+re-discover them: relative `--prefix` makes `make install` exit 0 into a
+path inside the (later-deleted) source tree — `build_from_source`
+absolutizes it; `configure` must be run as `sh ./configure` because our
+tar unpack may not preserve the exec bit; and `--disable-everything`
+disables the LIBRARIES too, so all six are re-enabled explicitly or the
+bindgen headers go missing.
 
 Version warning: rust-ffmpeg 9.x supports FFmpeg ≤ 7.x. BtbN's rolling
 `latest` tag is FFmpeg 8 (`avcodec-63.dll`) and the sys crate's probe
