@@ -472,7 +472,9 @@ fn build_from_source(root: &Path) -> Result<()> {
     let prefix_abs = if prefix.is_absolute() {
         prefix.clone()
     } else {
-        std::env::current_dir().context("resolving cwd")?.join(&prefix)
+        std::env::current_dir()
+            .context("resolving cwd")?
+            .join(&prefix)
     };
     let mut cfg_args: Vec<String> = SRC_CONFIGURE.iter().map(|s| s.to_string()).collect();
     cfg_args.push(format!(
