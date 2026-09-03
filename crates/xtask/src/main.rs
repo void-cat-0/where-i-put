@@ -38,9 +38,14 @@ mod pins {
         "3e61e96b44bce30f0fad9fc31955be7fe4d6690d6a5a2b65c62494e262f8369e",
     )];
     /// libclang via the PyPI wheel (smallest blessed source for the DLL
-    /// bindgen needs). Linux/macOS rely on system LLVM (`apt install
+    /// bindgen needs). Candidates tried in order: pythonhosted (works from
+    /// CI runners) then a CN mirror (useful from this dev machine).
+    /// Linux/macOS rely on system LLVM (`apt install
     /// libclang-dev` / brew llvm).
-    pub const LIBCLANG_WIN_WHEEL: &str = "https://mirrors.ustc.edu.cn/pypi/web/packages/0b/2d/3f480b1e1d31eb3d6de5e3ef641954e5c67430d5ac93b7fa7e07589576c7/libclang-18.1.1-py2.py3-none-win_amd64.whl";
+    pub const LIBCLANG_WIN_WHEELS: &[&str] = &[
+        "https://files.pythonhosted.org/packages/0b/2d/3f480b1e1d31eb3d6de5e3ef641954e5c67430d5ac93b7fa7e07589576c7/libclang-18.1.1-py2.py3-none-win_amd64.whl",
+        "https://mirrors.ustc.edu.cn/pypi/web/packages/0b/2d/3f480b1e1d31eb3d6de5e3ef641954e5c67430d5ac93b7fa7e07589576c7/libclang-18.1.1-py2.py3-none-win_amd64.whl",
+    ];
     // sha256 of the .whl archive itself (PyPI's published hash for this file),
     // NOT the extracted libclang.dll.
     pub const LIBCLANG_WIN_SHA: &str =
@@ -68,9 +73,17 @@ fn platform() -> &'static str {
 struct Artifact {
     /// Local directory name under target/vendor/.
     name: &'static str,
-    url: String,
+    /// Download candidates, tried in order (e.g. canonical then a CN mirror).
+    /// The manifest pins the first as identity.
+    urls: Vec<String>,
     sha256: Option<String>,
     kind: ArtifactKind,
+}
+
+impl Artifact {
+    fn url(&self) -> &str {
+        self.urls.first().map(String::as_str).unwrap_or("")
+    }
 }
 
 enum ArtifactKind {
@@ -89,12 +102,12 @@ fn artifacts() -> Vec<Artifact> {
             let ext = if os == "win64" { "zip" } else { "tar.xz" };
             Artifact {
                 name: "ffmpeg",
-                url: format!(
+                urls: vec![format!(
                     "https://github.com/BtbN/FFmpeg-Builds/releases/download/{}/{BTBN_BASE}-{os}-gpl-shared-7.1.{ext}",
                     pins::BTBN_TAG,
                     BTBN_BASE = pins::BTBN_BASE,
                     os = os
-                ),
+                )],
                 sha256: pins::FFMPEG_SHA
                     .iter()
                     .find(|(k, _)| *k == os)
@@ -104,7 +117,7 @@ fn artifacts() -> Vec<Artifact> {
         }
         _ => Artifact {
             name: "ffmpeg",
-            url: String::new(),
+            urls: vec![],
             sha256: None,
             kind: ArtifactKind::NotProvided,
         },
@@ -112,14 +125,17 @@ fn artifacts() -> Vec<Artifact> {
     let libclang = if os == "win64" {
         Artifact {
             name: "libclang",
-            url: pins::LIBCLANG_WIN_WHEEL.into(),
+            urls: pins::LIBCLANG_WIN_WHEELS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             sha256: Some(pins::LIBCLANG_WIN_SHA.into()),
             kind: ArtifactKind::LibclangDll,
         }
     } else {
         Artifact {
             name: "libclang",
-            url: String::new(),
+            urls: vec![],
             sha256: None,
             kind: ArtifactKind::NotProvided,
         }
@@ -219,7 +235,7 @@ fn install_status(root: &Path, art: &Artifact) -> Status {
             && root.join(art.name).join("include").exists()
     } else {
         m.platform == platform()
-            && m.url == art.url
+            && m.url == art.url()
             && art
                 .sha256
                 .as_ref()
@@ -298,7 +314,9 @@ fn unpack_zip(bytes: &[u8], dst: &Path, strip_top: bool, only: Option<&str>) -> 
     Ok(())
 }
 
-/// Unpack a .tar.xz (Linux FFmpeg builds) with the top dir stripped.
+/// Unpack a .tar.xz (Linux FFmpeg builds) with the top dir stripped. Uses
+/// `Entry::unpack`, which restores the header's mode on unix -- FFmpeg's
+/// extensionless ./configure otherwise hits exit 126 (Permission denied).
 fn unpack_tar_xz(bytes: &[u8], dst: &Path) -> Result<()> {
     let mut tar_bytes = Vec::new();
     lzma_rs::xz_decompress(&mut Cursor::new(bytes), &mut tar_bytes)
@@ -317,11 +335,7 @@ fn unpack_tar_xz(bytes: &[u8], dst: &Path) -> Result<()> {
             fs::create_dir_all(target)?;
             continue;
         }
-        if let Some(p) = target.parent() {
-            fs::create_dir_all(p)?;
-        }
-        let mut out = fs::File::create(&target)?;
-        std::io::copy(&mut entry, &mut out)?;
+        entry.unpack(&target)?;
     }
     Ok(())
 }
@@ -452,9 +466,10 @@ fn build_from_source(root: &Path) -> Result<()> {
         .map(|n| n.get())
         .unwrap_or(4)
         .to_string();
-    // configure is an extensionless shell script; `sh -c 'exec ... "$@"'`
-    // forwards args without quoting hazards (prefix may contain spaces).
-    let mut cargs: Vec<&str> = vec!["-c", "exec ./configure \"$@\"", "configure"];
+    // configure is an extensionless shell script without a guaranteed exec
+    // bit (our tar unpack may or may not preserve it depending on platform);
+    // `sh ./configure` runs it regardless. Args via "$@".
+    let mut cargs: Vec<&str> = vec!["-c", "sh ./configure \"$@\"", "configure"];
     cargs.extend(cfg_args.iter().map(|s| s.as_str()));
     run("sh", &cargs, Some(&src), "configure")?;
     run("make", &["-j", &jobs], Some(&src), "make")?;
@@ -500,11 +515,27 @@ fn run(program: &str, args: &[&str], cwd: Option<&Path>, label: &str) -> Result<
 }
 
 fn install(root: &Path, art: &Artifact) -> Result<()> {
-    println!(
-        "downloading {} ...",
-        art.url.rsplit('/').next().unwrap_or("")
-    );
-    let bytes = download(&art.url)?;
+    // Try candidates in order (canonical, then mirrors); bytes are hash-
+    // verified so a mirror serving stale/corrupt data fails closed.
+    let mut bytes = Vec::new();
+    let mut last_err = None;
+    for url in &art.urls {
+        println!("downloading {} ...", url.rsplit('/').next().unwrap_or(""));
+        match download(url) {
+            Ok(b) => {
+                bytes = b;
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                println!("  fetch failed from {url}: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(e);
+    }
     let recorded_sha = match &art.sha256 {
         Some(pin) => {
             verify_sha256(&bytes, pin)?;
@@ -522,7 +553,7 @@ fn install(root: &Path, art: &Artifact) -> Result<()> {
     }
     fs::create_dir_all(&dir)?;
     match art.kind {
-        ArtifactKind::ArchiveFlatten if art.url.ends_with(".zip") => {
+        ArtifactKind::ArchiveFlatten if art.url().ends_with(".zip") => {
             unpack_zip(&bytes, &dir, true, None)?
         }
         ArtifactKind::ArchiveFlatten => unpack_tar_xz(&bytes, &dir)?,
@@ -530,7 +561,7 @@ fn install(root: &Path, art: &Artifact) -> Result<()> {
         ArtifactKind::NotProvided => unreachable!("install is never called for NotProvided"),
     }
     let manifest = Manifest {
-        url: art.url.clone(),
+        url: art.url().into(),
         sha256: Some(recorded_sha),
         source_note: note_for(art.name).into(),
         platform: platform().into(),

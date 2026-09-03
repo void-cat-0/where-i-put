@@ -56,6 +56,11 @@ jobs:
       # libclang-dev for bindgen (rtsp/yolo side); libv4l-dev because nokhwa's
       # linux input backend builds v4l2-sys-mit against kernel media headers.
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev libv4l-dev
+      # config.toml points LIBCLANG_PATH at the windows-only vendor wheel;
+      # on linux override with the apt path (force=false lets env win)
+      - name: point bindgen at system libclang
+        shell: bash
+        run: echo "LIBCLANG_PATH=$(dirname "$(ls /usr/lib/llvm-*/lib/libclang.so | head -1)")" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - name: clippy
         shell: bash
@@ -83,7 +88,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: libclang (linux)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+        shell: bash
+        run: |
+          sudo apt-get update && sudo apt-get install -y libclang-dev
+          echo "LIBCLANG_PATH=$(dirname "$(ls /usr/lib/llvm-*/lib/libclang.so | head -1)")" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - name: xtask setup (pinned zip path)
         shell: bash
@@ -110,6 +118,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev nasm make
+      - name: point bindgen at system libclang
+        shell: bash
+        run: echo "LIBCLANG_PATH=$(dirname "$(ls /usr/lib/llvm-*/lib/libclang.so | head -1)")" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: build ffmpeg from source
