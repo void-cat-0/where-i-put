@@ -130,19 +130,34 @@ jobs:
           cargo xtask setup --from-source 2>&1 | tee source-build.log || {
             grep -iE "^error|failed|cannot|No such|not found" source-build.log | head -30 | sed 's/^/::error::/'
             tail -40 source-build.log | sed 's/^/::error::/' ; exit 1; }
-      - name: dump source tree layout
+      - name: inspect source tree layout (public annotations, assert headers)
         shell: bash
         run: |
-          echo "=== top ==="; ls target/vendor/ffmpeg || true
-          echo "=== include dirs ==="; ls target/vendor/ffmpeg/include 2>/dev/null || true
-          echo "=== lib sample ==="; ls target/vendor/ffmpeg/lib 2>/dev/null | head -20 || true
-          echo "=== bin sample (source installs .so into lib; only zip has bin) ==="
-          ls target/vendor/ffmpeg/bin 2>/dev/null | head -10 || true
+          set -uo pipefail
+          SUMMARY=$(
+            echo "== vendor root =="; ls target/vendor 2>&1
+            echo "== ffmpeg top =="; ls target/vendor/ffmpeg 2>&1
+            echo "== include/ =="; ls target/vendor/ffmpeg/include 2>&1
+            echo "== avutil.h anywhere? =="; find target/vendor/ffmpeg -name avutil.h 2>/dev/null | head -3 || echo NONE
+            echo "== header count =="; find target/vendor/ffmpeg -name '*.h' 2>/dev/null | wc -l
+            echo "== libs =="; ls target/vendor/ffmpeg/lib 2>/dev/null | head -12 || echo "no lib/"
+            echo "== manifest =="; cat target/vendor/ffmpeg/manifest.json 2>/dev/null | head -6 || echo "no manifest"
+          )
+          echo "$SUMMARY" | sed 's/^/::notice::/'
+          # fail FAST here if headers are missing, with the full picture above
+          if [ ! -f target/vendor/ffmpeg/include/libavutil/avutil.h ]; then
+            echo "$SUMMARY" | sed 's/^/::error::tree:'
+            echo "::error::source tree has no avutil.h -- make install layout issue"
+            exit 1
+          fi
       - name: test against source tree
         shell: bash
         run: |
           set -o pipefail
+          echo "::notice::at test: avutil.h=$(ls target/vendor/ffmpeg/include/libavutil/avutil.h 2>&1)"
+          echo "::notice::PWD=$PWD"
           cargo test --workspace --features rtsp 2>&1 | tee test.log || {
             # gcc/cl error lines are prefixed by file:line:, so don't anchor ^
             grep -aiE "fatal error|no such file|undefined reference|cannot find|error\[|panicked|FAILED" test.log | head -25 | sed 's/^/::error::/'
+            grep -aE "rustc-link-search|FFMPEG_DIR" test.log | head -6 | sed 's/^/::error::search:/'
             tail -30 test.log | sed 's/^/::error::/' ; exit 1; }
