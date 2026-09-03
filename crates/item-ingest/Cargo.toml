@@ -33,10 +33,15 @@ default-features = false
 features = ["input-native", "decoding"]
 
 # RTSP/IP-camera frame source via FFmpeg (links native libav*; see README for
-# the FFMPEG_DIR setup used on this machine).
+# the FFMPEG_DIR setup used on this machine). Features mirror what we actually
+# use -- and, critically, what `xtask setup --from-source` installs: a
+# minimized tree has NO libavdevice/avfilter, and ffmpeg-sys-next's probes
+# fail at headers that aren't there.
 [dependencies.ffmpeg-next]
 version = "9"
 optional = true
+default-features = false
+features = ["codec", "format", "software-scaling"]
 
 [dependencies.tokio-stream]
 version = "0.1"
