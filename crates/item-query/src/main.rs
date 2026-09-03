@@ -28,7 +28,11 @@ enum Cmd {
         limit: i64,
     },
     /// Ask a natural-language question about item locations.
-    Ask { question: String, #[arg(long)] label: Option<String> },
+    Ask {
+        question: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -51,8 +55,20 @@ async fn main() -> anyhow::Result<()> {
                     w.chars().filter(|c| c.is_alphabetic()).count() >= 2
                         && !matches!(
                             w.as_str(),
-                            "where" | "is" | "are" | "my" | "the" | "did" | "do" | "i"
-                                | "put" | "see" | "was" | "at" | "in" | "on"
+                            "where"
+                                | "is"
+                                | "are"
+                                | "my"
+                                | "the"
+                                | "did"
+                                | "do"
+                                | "i"
+                                | "put"
+                                | "see"
+                                | "was"
+                                | "at"
+                                | "in"
+                                | "on"
                         )
                 })
                 .unwrap_or_else(|| needle.to_lowercase());
@@ -62,13 +78,18 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             let prompt = item_query::build_prompt(&question, &obs);
-            match (std::env::var("ITEM_VLM_BASE_URL"), std::env::var("ITEM_VLM_MODEL")) {
+            match (
+                std::env::var("ITEM_VLM_BASE_URL"),
+                std::env::var("ITEM_VLM_MODEL"),
+            ) {
                 (Ok(base), Ok(model)) => {
                     let client = VlmClient::new(base, model);
                     println!("{}", client.ask(&prompt).await?);
                 }
                 _ => {
-                    println!("(set ITEM_VLM_BASE_URL / ITEM_VLM_MODEL to answer via VLM; raw log below)");
+                    println!(
+                        "(set ITEM_VLM_BASE_URL / ITEM_VLM_MODEL to answer via VLM; raw log below)"
+                    );
                     print_rows(&obs);
                 }
             }

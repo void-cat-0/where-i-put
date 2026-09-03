@@ -35,7 +35,12 @@ pub struct MockSource {
 
 impl MockSource {
     pub fn new(camera_id: impl Into<String>, frames: u32, size: (u32, u32)) -> Self {
-        Self { camera_id: camera_id.into(), remaining: frames, width: size.0, height: size.1 }
+        Self {
+            camera_id: camera_id.into(),
+            remaining: frames,
+            width: size.0,
+            height: size.1,
+        }
     }
 }
 
@@ -63,31 +68,48 @@ pub mod nokhwa {
     use super::{Frame, FrameSource, SourceError};
     use item_core::FrameMeta;
 
+    /// USB/webcam source. The underlying nokhwa `Camera` is created LAZILY on
+    /// the first `next_frame` call: its DirectShow/MediaFoundation backends
+    /// carry COM apartment affinity with the creating thread, so we defer
+    /// creation until the value is already living on its worker thread (the
+    /// FrameSource usage pattern: one dedicated thread owns the source).
     pub struct NokhwaSource {
-        cam: ::nokhwa::input_api::Camera,
         camera_id: String,
+        index: u32,
+        cam: Option<::nokhwa::Camera>,
     }
 
     impl NokhwaSource {
         /// `index` is the OS camera index (0 = built-in webcam on most machines).
-        pub fn new(camera_id: impl Into<String>, index: usize) -> Result<Self, SourceError> {
-            use ::nokhwa::{parameters::DeviceApi, query_camera};
-            let config = query_camera(DeviceApi::Auto, index)
-                .map_err(|e| SourceError::Capture(Box::new(e)))?;
-            let cam = ::nokhwa::input_api::Camera::new(config)
-                .map_err(|e| SourceError::Capture(Box::new(e)))?;
-            Ok(Self { cam, camera_id: camera_id.into() })
+        pub fn new(camera_id: impl Into<String>, index: u32) -> Self {
+            Self {
+                camera_id: camera_id.into(),
+                index,
+                cam: None,
+            }
         }
     }
 
     impl FrameSource for NokhwaSource {
         fn next_frame(&mut self) -> Result<Frame, SourceError> {
-            let buf = self.cam.read().map_err(|e| SourceError::Capture(Box::new(e)))?;
+            use nokhwa::pixel_format::RgbFormat;
+            use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
+            if self.cam.is_none() {
+                let cam = ::nokhwa::Camera::new(
+                    CameraIndex::Index(self.index),
+                    RequestedFormat::new::<RgbFormat>(
+                        RequestedFormatType::AbsoluteHighestFrameRate,
+                    ),
+                )
+                .map_err(|e| SourceError::Capture(Box::new(e)))?;
+                self.cam = Some(cam);
+            }
+            let cam = self.cam.as_mut().expect("just initialized");
+            let buf = cam.frame().map_err(|e| SourceError::Capture(Box::new(e)))?;
             let img = buf
-                .decode()
-                .map_err(|e| SourceError::Capture(Box::new(e)))?
-                .to_rgb8();
-            let (w, h) = img.dimensions();
+                .decode_image::<RgbFormat>()
+                .map_err(|e| SourceError::Capture(Box::new(e)))?;
+            let (w, h) = (img.width(), img.height());
             Ok(Frame {
                 meta: FrameMeta {
                     camera_id: self.camera_id.clone(),
@@ -100,6 +122,12 @@ pub mod nokhwa {
             })
         }
     }
+
+    // SAFETY: only the not-yet-created config crosses threads. After the
+    // first `next_frame`, the Camera exists and must stay on that thread;
+    // nothing in this crate re-sends a live source (one thread owns it per
+    // its whole life, see preview::spawn_streamer).
+    unsafe impl Send for NokhwaSource {}
 }
 
 #[cfg(feature = "rtsp")]
@@ -161,10 +189,10 @@ pub mod rtsp {
 
             let input = ffmpeg::format::input_with_dictionary(url, dic).map_err(err)?;
             let (video_index, decoder, scaler, rgb_frame) = {
-                let stream =
-                    input.streams().best(ffmpeg::media::Type::Video).ok_or_else(|| {
-                        SourceError::Capture("rtsp stream has no video".into())
-                    })?;
+                let stream = input
+                    .streams()
+                    .best(ffmpeg::media::Type::Video)
+                    .ok_or_else(|| SourceError::Capture("rtsp stream has no video".into()))?;
                 let video_index = stream.index();
                 let mut context =
                     ffmpeg::codec::context::Context::from_parameters(stream.parameters())
@@ -175,10 +203,11 @@ pub mod rtsp {
                 // 8-core machine. Cost: frame threading reorders ~4 frames
                 // in flight (~160ms latency tax; slice threading would avoid
                 // it but HEVC slice parallelism is rare in camera streams).
+                // (ffmpeg-next 9's threading Config has exactly these two
+                // fields under its default ffmpeg_6_0 cfg; no ..Default here.)
                 context.set_threading(ffmpeg::codec::threading::Config {
                     kind: ffmpeg::codec::threading::Type::Frame,
                     count: 4,
-                    ..Default::default()
                 });
                 // No B-frames in this stream (verified: has_b_frames=0), so
                 // telling the decoder to emit each frame immediately is safe
@@ -243,9 +272,11 @@ pub mod rtsp {
                 }
             }
 
-            self.scaler.run(&self.decoded, &mut self.rgb_frame).map_err(err)?;
+            self.scaler
+                .run(&self.decoded, &mut self.rgb_frame)
+                .map_err(err)?;
             let (w, h) = (self.rgb_frame.width(), self.rgb_frame.height());
-            let stride = self.rgb_frame.stride(0) as usize;
+            let stride = self.rgb_frame.stride(0);
             let row = (w as usize) * 3;
             let mut rgb = vec![0u8; row * h as usize];
             let data = self.rgb_frame.data(0);

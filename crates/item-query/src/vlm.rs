@@ -40,7 +40,11 @@ pub struct VlmClient {
 impl VlmClient {
     /// `base_url` like "http://127.0.0.1:8080/v1".
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
-        Self { base_url: base_url.into(), model: model.into(), http: reqwest::Client::new() }
+        Self {
+            base_url: base_url.into(),
+            model: model.into(),
+            http: reqwest::Client::new(),
+        }
     }
 
     pub async fn ask(&self, prompt: &str) -> anyhow::Result<String> {
@@ -54,12 +58,18 @@ impl VlmClient {
                               provided by the user. If the log lacks the item, \
                               say so plainly.",
                 },
-                Message { role: "user", content: prompt },
+                Message {
+                    role: "user",
+                    content: prompt,
+                },
             ],
         };
         let resp: ChatResponse = self
             .http
-            .post(format!("{}/chat/completions", self.base_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/chat/completions",
+                self.base_url.trim_end_matches('/')
+            ))
             .json(&body)
             .send()
             .await?

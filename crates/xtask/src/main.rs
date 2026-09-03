@@ -17,7 +17,7 @@ use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,7 +33,10 @@ mod pins {
     pub const BTBN_BASE: &str = "ffmpeg-n7.1.5-12-g1fdbca85aa";
     /// sha256 of the downloaded archive, per BtbN platform key. win64 was
     /// captured from a verified setup run; others get computed on first use.
-    pub const FFMPEG_SHA: &[(&str, &str)] = &[(&"win64", "3e61e96b44bce30f0fad9fc31955be7fe4d6690d6a5a2b65c62494e262f8369e")];
+    pub const FFMPEG_SHA: &[(&str, &str)] = &[(
+        "win64",
+        "3e61e96b44bce30f0fad9fc31955be7fe4d6690d6a5a2b65c62494e262f8369e",
+    )];
     /// libclang via the PyPI wheel (smallest blessed source for the DLL
     /// bindgen needs). Linux/macOS rely on system LLVM (`apt install
     /// libclang-dev` / brew llvm).
@@ -47,8 +50,7 @@ mod pins {
     /// artifacts in CI). sha256 computed from the downloaded tarball on
     /// 2026-09-03; cross-check against ffmpeg.org's release MD5/GPG if paranoid.
     pub const SRC_URL: &str = "https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz";
-    pub const SRC_SHA: &str =
-        "de668509caf9e35e3cd162473441fdb29538c6d96ed080292b3cf9e6fc5d558f";
+    pub const SRC_SHA: &str = "de668509caf9e35e3cd162473441fdb29538c6d96ed080292b3cf9e6fc5d558f";
 }
 
 fn platform() -> &'static str {
@@ -93,11 +95,19 @@ fn artifacts() -> Vec<Artifact> {
                     BTBN_BASE = pins::BTBN_BASE,
                     os = os
                 ),
-                sha256: pins::FFMPEG_SHA.iter().find(|(k, _)| *k == os).map(|(_, v)| v.to_string()),
+                sha256: pins::FFMPEG_SHA
+                    .iter()
+                    .find(|(k, _)| *k == os)
+                    .map(|(_, v)| v.to_string()),
                 kind: ArtifactKind::ArchiveFlatten,
             }
         }
-        _ => Artifact { name: "ffmpeg", url: String::new(), sha256: None, kind: ArtifactKind::NotProvided },
+        _ => Artifact {
+            name: "ffmpeg",
+            url: String::new(),
+            sha256: None,
+            kind: ArtifactKind::NotProvided,
+        },
     };
     let libclang = if os == "win64" {
         Artifact {
@@ -107,7 +117,12 @@ fn artifacts() -> Vec<Artifact> {
             kind: ArtifactKind::LibclangDll,
         }
     } else {
-        Artifact { name: "libclang", url: String::new(), sha256: None, kind: ArtifactKind::NotProvided }
+        Artifact {
+            name: "libclang",
+            url: String::new(),
+            sha256: None,
+            kind: ArtifactKind::NotProvided,
+        }
     };
     vec![ffmpeg, libclang]
 }
@@ -187,7 +202,11 @@ fn install_status(root: &Path, art: &Artifact) -> Status {
         return Status::NotProvided;
     }
     let Some(m) = Manifest::load(root, art.name) else {
-        return if root.join(art.name).exists() { Status::Stale } else { Status::Missing };
+        return if root.join(art.name).exists() {
+            Status::Stale
+        } else {
+            Status::Missing
+        };
     };
     // url+platform must match the pins; a sha recorded in the manifest may be
     // the computed one (unpinned platform), so only compare when pinned. A
@@ -201,28 +220,35 @@ fn install_status(root: &Path, art: &Artifact) -> Status {
     } else {
         m.platform == platform()
             && m.url == art.url
-            && art.sha256.as_ref().is_none_or(|pin| m.sha256.as_deref() == Some(pin))
+            && art
+                .sha256
+                .as_ref()
+                .is_none_or(|pin| m.sha256.as_deref() == Some(pin))
             && root.join(art.name).exists()
     };
-    if fresh {
-        Status::Cached
-    } else {
-        Status::Stale
-    }
+    if fresh { Status::Cached } else { Status::Stale }
 }
 
 fn download(url: &str) -> Result<Vec<u8>> {
-    let mut resp = ureq::get(url).call().with_context(|| format!("GET {url}"))?;
+    let mut resp = ureq::get(url)
+        .call()
+        .with_context(|| format!("GET {url}"))?;
     if !resp.status().is_success() {
         bail!("GET {url} -> HTTP {}", resp.status());
     }
     let mut buf = Vec::new();
-    resp.body_mut().as_reader().read_to_end(&mut buf).context("reading response body")?;
+    resp.body_mut()
+        .as_reader()
+        .read_to_end(&mut buf)
+        .context("reading response body")?;
     Ok(buf)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn verify_sha256(bytes: &[u8], want: &str) -> Result<()> {
@@ -302,11 +328,15 @@ fn unpack_tar_xz(bytes: &[u8], dst: &Path) -> Result<()> {
 
 fn note_for(name: &str) -> &'static str {
     match name {
-        "ffmpeg" => "FFmpeg 7.1 shared build (BtbN): include/, lib/ (import libs), \
+        "ffmpeg" => {
+            "FFmpeg 7.1 shared build (BtbN): include/, lib/ (import libs), \
                      bin/ (runtime DLLs). Consumed by ffmpeg-sys-next via FFMPEG_DIR \
-                     (.cargo/config.toml). Pinned 7.1: rust-ffmpeg 9.x rejects FFmpeg 8.",
-        "libclang" => "libclang.dll extracted from the libclang PyPI wheel; bindgen \
-                       (ffmpeg-sys-next build.rs) needs it via LIBCLANG_PATH.",
+                     (.cargo/config.toml). Pinned 7.1: rust-ffmpeg 9.x rejects FFmpeg 8."
+        }
+        "libclang" => {
+            "libclang.dll extracted from the libclang PyPI wheel; bindgen \
+                       (ffmpeg-sys-next build.rs) needs it via LIBCLANG_PATH."
+        }
         _ => "vendor toolchain",
     }
 }
@@ -329,7 +359,10 @@ fn require_build_tools() -> Result<()> {
         missing.push(("sh", "Windows: Git Bash (already typical) or MSYS2"));
     }
     if !probe("perl", &["--version"]) {
-        missing.push(("perl", "configure is a perl-driven script; Git Bash ships perl; MSYS2: pacman -S perl"));
+        missing.push((
+            "perl",
+            "configure is a perl-driven script; Git Bash ships perl; MSYS2: pacman -S perl",
+        ));
     }
     if !probe("make", &["--version"]) {
         missing.push(("make", "Windows: MSYS2 `pacman -S make` (Git Bash does NOT ship make); Linux: build-essential; macOS: CLT"));
@@ -338,9 +371,8 @@ fn require_build_tools() -> Result<()> {
         missing.push(("nasm", "x86 asm backend; MSYS2: pacman -S nasm; Linux: apt install nasm; macOS: brew install nasm"));
     }
     if !missing.is_empty() {
-        let mut msg = String::from(
-            "FFmpeg from-source needs a POSIX build environment; missing:\n",
-        );
+        let mut msg =
+            String::from("FFmpeg from-source needs a POSIX build environment; missing:\n");
         for (tool, hint) in &missing {
             msg.push_str(&format!("  - {tool}: {hint}\n"));
         }
@@ -408,7 +440,10 @@ fn build_from_source(root: &Path) -> Result<()> {
     // FFmpeg's configure writes into the source tree and installs to a
     // prefix; on Windows it wants forward slashes for the --prefix path.
     let mut cfg_args: Vec<String> = SRC_CONFIGURE.iter().map(|s| s.to_string()).collect();
-    cfg_args.push(format!("--prefix={}", prefix.display().to_string().replace('\\', "/")));
+    cfg_args.push(format!(
+        "--prefix={}",
+        prefix.display().to_string().replace('\\', "/")
+    ));
     if cfg!(windows) {
         cfg_args.push("--toolchain=msvc".into());
     }
@@ -456,13 +491,19 @@ fn run(program: &str, args: &[&str], cwd: Option<&Path>, label: &str) -> Result<
         .status()
         .with_context(|| format!("spawn {label}: {program}"))?;
     if !status.success() {
-        bail!("{label} failed (exit {:?}); see output above", status.code());
+        bail!(
+            "{label} failed (exit {:?}); see output above",
+            status.code()
+        );
     }
     Ok(())
 }
 
 fn install(root: &Path, art: &Artifact) -> Result<()> {
-    println!("downloading {} ...", art.url.rsplit('/').next().unwrap_or(""));
+    println!(
+        "downloading {} ...",
+        art.url.rsplit('/').next().unwrap_or("")
+    );
     let bytes = download(&art.url)?;
     let recorded_sha = match &art.sha256 {
         Some(pin) => {
@@ -485,9 +526,7 @@ fn install(root: &Path, art: &Artifact) -> Result<()> {
             unpack_zip(&bytes, &dir, true, None)?
         }
         ArtifactKind::ArchiveFlatten => unpack_tar_xz(&bytes, &dir)?,
-        ArtifactKind::LibclangDll => {
-            unpack_zip(&bytes, &dir, false, Some("native/libclang.dll"))?
-        }
+        ArtifactKind::LibclangDll => unpack_zip(&bytes, &dir, false, Some("native/libclang.dll"))?,
         ArtifactKind::NotProvided => unreachable!("install is never called for NotProvided"),
     }
     let manifest = Manifest {
@@ -532,7 +571,11 @@ fn main() -> Result<()> {
             }
             println!(
                 "\n{}",
-                if all_ready { "ready: cargo build --features rtsp" } else { "run: cargo xtask setup" }
+                if all_ready {
+                    "ready: cargo build --features rtsp"
+                } else {
+                    "run: cargo xtask setup"
+                }
             );
             Ok(())
         }
@@ -555,9 +598,11 @@ fn main() -> Result<()> {
                         _ => install(&root, &art)?,
                     }
                 }
-                println!("\nfrom-source setup complete: FFMPEG_DIR is a locally built \
+                println!(
+                    "\nfrom-source setup complete: FFMPEG_DIR is a locally built \
                           shared tree (same layout as the zip; run `cargo xtask setup` \
-                          without the flag to restore the prebuilt zip).");
+                          without the flag to restore the prebuilt zip)."
+                );
                 return Ok(());
             }
             for art in artifacts() {
@@ -568,8 +613,10 @@ fn main() -> Result<()> {
                     Status::NotProvided => {
                         let hint = match art.name {
                             "ffmpeg" => "brew install ffmpeg (or set FFMPEG_DIR yourself)",
-                            "libclang" => "apt install libclang-dev / brew install llvm; \
-                                           then export LIBCLANG_PATH accordingly",
+                            "libclang" => {
+                                "apt install libclang-dev / brew install llvm; \
+                                           then export LIBCLANG_PATH accordingly"
+                            }
                             _ => "",
                         };
                         println!("skipping {} on {}: {hint}", art.name, platform());

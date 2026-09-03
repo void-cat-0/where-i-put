@@ -40,14 +40,19 @@ fn main() {
     let out_dir = env::var_os("OUT_DIR").map(PathBuf::from).expect("OUT_DIR");
     let profile_dir = out_dir
         .ancestors()
-        .find(|p| matches!(p.file_name().and_then(|n| n.to_str()), Some("debug") | Some("release")))
+        .find(|p| {
+            matches!(
+                p.file_name().and_then(|n| n.to_str()),
+                Some("debug") | Some("release")
+            )
+        })
         .expect("OUT_DIR under target/<profile>/");
     let mut copied = 0usize;
     for dll in &dlls {
         let dst = profile_dir.join(dll.file_name().unwrap());
-        let fresh = dst.metadata().is_ok_and(|m| {
-            m.len() == dll.metadata().map(|s| s.len()).unwrap_or(u64::MAX)
-        });
+        let fresh = dst
+            .metadata()
+            .is_ok_and(|m| m.len() == dll.metadata().map(|s| s.len()).unwrap_or(u64::MAX));
         if fresh {
             continue;
         }

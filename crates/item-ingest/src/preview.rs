@@ -18,16 +18,16 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header;
 use axum::http::StatusCode;
+use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
+use futures_util::stream::{StreamExt as _, TryStreamExt as _};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
-use futures_util::stream::{StreamExt as _, TryStreamExt as _};
 
 use crate::source::{FrameSource, rtsp::RtspSource};
 
@@ -110,8 +110,7 @@ fn encode_jpeg(rgb: &[u8], width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
     let img = image::RgbImage::from_raw(width, height, rgb.to_vec())
         .ok_or_else(|| anyhow::anyhow!("rgb buffer shorter than frame size"))?;
     let mut out = std::io::Cursor::new(Vec::new());
-    let mut enc =
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY);
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY);
     enc.encode(&img, width, height, image::ExtendedColorType::Rgb8)?;
     Ok(out.into_inner())
 }
@@ -150,7 +149,10 @@ async fn snapshot(State(tx): State<FrameTx>) -> Response {
     let rx = tx.subscribe();
     match BroadcastStream::new(rx).next().await {
         Some(Ok(jpeg)) => (
-            [(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "no-store")],
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
             jpeg.to_vec(),
         )
             .into_response(),
@@ -159,14 +161,18 @@ async fn snapshot(State(tx): State<FrameTx>) -> Response {
 }
 
 async fn mjpeg(State(tx): State<FrameTx>) -> Response {
-    let stream = BroadcastStream::new(tx.subscribe())
-        .filter_map(|item| async move { item.ok().map(|jpeg| Ok::<_, std::io::Error>(part(&jpeg))) });
+    let stream = BroadcastStream::new(tx.subscribe()).filter_map(|item| async move {
+        item.ok().map(|jpeg| Ok::<_, std::io::Error>(part(&jpeg)))
+    });
     let body = Body::from_stream(stream.map_err(std::io::Error::other));
     (
-        [(
-            header::CONTENT_TYPE,
-            "multipart/x-mixed-replace; boundary=frame",
-        ), (header::CACHE_CONTROL, "no-store")],
+        [
+            (
+                header::CONTENT_TYPE,
+                "multipart/x-mixed-replace; boundary=frame",
+            ),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         body,
     )
         .into_response()

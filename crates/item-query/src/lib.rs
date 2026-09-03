@@ -26,8 +26,11 @@ pub fn build_prompt(query: &str, obs: &[Observation]) -> String {
         )
         .unwrap();
     }
-    write!(s, "\nQuestion: \"{query}\". Answer in one or two sentences using only the log.")
-        .unwrap();
+    write!(
+        s,
+        "\nQuestion: \"{query}\". Answer in one or two sentences using only the log."
+    )
+    .unwrap();
     s
 }
 

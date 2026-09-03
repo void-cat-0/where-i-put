@@ -124,7 +124,8 @@ impl Store {
         snapshot: Option<&str>,
         window: Duration,
     ) -> Result<i64> {
-        let cutoff = seen_at - chrono::Duration::from_std(window).expect("window fits chrono range");
+        let cutoff =
+            seen_at - chrono::Duration::from_std(window).expect("window fits chrono range");
         let existing: Option<(i64, String)> = self
             .conn
             .query_row(
@@ -159,7 +160,8 @@ impl Store {
     /// Most recent observations, optionally filtered by a label substring
     /// (case-insensitive) and/or zone. This is the query layer's data source.
     pub fn recent(&self, label_like: Option<&str>, limit: i64) -> Result<Vec<Observation>> {
-        let sql = format!(
+        let sql =
+            format!(
             "SELECT id, camera_id, zone, label, first_seen, last_seen, hit_count, sample_snapshot
              FROM observations
              {}
@@ -192,11 +194,13 @@ impl Store {
         fn parse_ts(s: &str) -> rusqlite::Result<DateTime<Utc>> {
             DateTime::parse_from_rfc3339(s)
                 .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                ))
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
         }
     }
 }
@@ -214,16 +218,37 @@ mod tests {
     fn sightings_merge_within_window_then_split_after() {
         let s = Store::in_memory().unwrap();
         let id1 = s
-            .record_sighting("cam1", "entrance", "keys", ts(0), None, DEFAULT_DEDUP_WINDOW)
+            .record_sighting(
+                "cam1",
+                "entrance",
+                "keys",
+                ts(0),
+                None,
+                DEFAULT_DEDUP_WINDOW,
+            )
             .unwrap();
         // +1 min: merged into the same observation
         let id2 = s
-            .record_sighting("cam1", "entrance", "keys", ts(1), None, DEFAULT_DEDUP_WINDOW)
+            .record_sighting(
+                "cam1",
+                "entrance",
+                "keys",
+                ts(1),
+                None,
+                DEFAULT_DEDUP_WINDOW,
+            )
             .unwrap();
         assert_eq!(id1, id2);
         // +10 min: outside the 5-min window -> a new observation
         let id3 = s
-            .record_sighting("cam1", "entrance", "keys", ts(11), None, DEFAULT_DEDUP_WINDOW)
+            .record_sighting(
+                "cam1",
+                "entrance",
+                "keys",
+                ts(11),
+                None,
+                DEFAULT_DEDUP_WINDOW,
+            )
             .unwrap();
         assert_ne!(id1, id3);
 
@@ -236,8 +261,12 @@ mod tests {
     #[test]
     fn zones_from_region_rects() {
         let s = Store::in_memory().unwrap();
-        s.upsert_region("cam1", "entrance", [0.0, 0.0, 200.0, 400.0]).unwrap();
-        assert_eq!(s.zone_for_point("cam1", (100.0, 300.0)).unwrap(), "entrance");
+        s.upsert_region("cam1", "entrance", [0.0, 0.0, 200.0, 400.0])
+            .unwrap();
+        assert_eq!(
+            s.zone_for_point("cam1", (100.0, 300.0)).unwrap(),
+            "entrance"
+        );
         assert_eq!(s.zone_for_point("cam1", (999.0, 999.0)).unwrap(), "frame");
     }
 }

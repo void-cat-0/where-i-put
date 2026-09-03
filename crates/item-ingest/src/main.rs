@@ -74,8 +74,7 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         // stdout is reserved for command output (e.g. --detect results);
         // logs (including the ort bridge, which is noisy) go to stderr.
@@ -110,8 +109,13 @@ fn main() -> anyhow::Result<()> {
     let app = match args.preview.clone() {
         Some(url) => {
             // Credentials are part of the url; log only scheme+host.
-            tracing::info!(target_url = redact_url(&url), "web preview enabled at GET /preview");
-            app.merge(item_ingest::preview::router(item_ingest::preview::spawn_streamer(url)))
+            tracing::info!(
+                target_url = redact_url(&url),
+                "web preview enabled at GET /preview"
+            );
+            app.merge(item_ingest::preview::router(
+                item_ingest::preview::spawn_streamer(url),
+            ))
         }
         None => app,
     };
@@ -119,7 +123,9 @@ fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = args.listen.parse().context("bad --listen")?;
     tracing::info!(%addr, "frigate webhook server listening");
 
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
@@ -153,7 +159,10 @@ fn demo_pass(store: &Store) -> anyhow::Result<()> {
         item_core::store::DEFAULT_DEDUP_WINDOW,
     )?;
     let obs = store.recent(Some("keys"), 5)?;
-    println!("demo observation: {:?}", obs.first().map(|o| (&o.zone, &o.label)));
+    println!(
+        "demo observation: {:?}",
+        obs.first().map(|o| (&o.zone, &o.label))
+    );
     Ok(())
 }
 
@@ -173,7 +182,12 @@ fn redact_url(url: &str) -> String {
 /// Run YOLO-onnx on a single image file (yolo verification / smoke test):
 /// decode -> detect -> NMS report with timing.
 #[cfg(feature = "yolo")]
-fn detect_pass(img_path: &str, model_path: &str, input_size: usize, conf: f32) -> anyhow::Result<()> {
+fn detect_pass(
+    img_path: &str,
+    model_path: &str,
+    input_size: usize,
+    conf: f32,
+) -> anyhow::Result<()> {
     use std::time::Instant;
 
     use item_ingest::detector::yolo::YoloDetector;
@@ -192,20 +206,31 @@ fn detect_pass(img_path: &str, model_path: &str, input_size: usize, conf: f32) -
     )
     .map_err(|e| anyhow::anyhow!("model load: {e}"))?;
     let load_ms = started.elapsed();
-    let raw = det.detect(img.as_raw(), w, h).map_err(|e| anyhow::anyhow!("inference: {e}"))?;
+    let raw = det
+        .detect(img.as_raw(), w, h)
+        .map_err(|e| anyhow::anyhow!("inference: {e}"))?;
     let infer_ms = started.elapsed();
     let kept: Vec<_> = item_core::geo::nms(&raw, 0.45)
         .into_iter()
         .map(|i| raw[i].clone())
         .collect();
-    println!("load {:.0}ms | inference {:.0}ms | {} raw -> {} kept",
+    println!(
+        "load {:.0}ms | inference {:.0}ms | {} raw -> {} kept",
         load_ms.as_secs_f64() * 1e3,
         (infer_ms - load_ms).as_secs_f64() * 1e3,
         raw.len(),
-        kept.len());
+        kept.len()
+    );
     for d in &kept {
-        println!("  {:<14} {:>5.0}%  [{:.0}, {:.0}, {:.0}, {:.0}]",
-            d.label, d.confidence * 100.0, d.bbox[0], d.bbox[1], d.bbox[2], d.bbox[3]);
+        println!(
+            "  {:<14} {:>5.0}%  [{:.0}, {:.0}, {:.0}, {:.0}]",
+            d.label,
+            d.confidence * 100.0,
+            d.bbox[0],
+            d.bbox[1],
+            d.bbox[2],
+            d.bbox[3]
+        );
     }
     Ok(())
 }
@@ -217,8 +242,8 @@ fn detect_pass(img_path: &str, model_path: &str, input_size: usize, conf: f32) -
 fn rtsp_pass(store: &Store, camera_id: &str, url: &str, max_frames: u64) -> anyhow::Result<()> {
     use item_ingest::source::rtsp::RtspSource;
 
-    let mut source = RtspSource::new(camera_id, url)
-        .map_err(|e| anyhow::anyhow!("rtsp connect failed: {e}"))?;
+    let mut source =
+        RtspSource::new(camera_id, url).map_err(|e| anyhow::anyhow!("rtsp connect failed: {e}"))?;
     let detector = NullDetector;
     let mut n = 0u64;
     loop {

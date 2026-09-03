@@ -61,7 +61,11 @@ mod tests {
     use crate::Detection;
 
     fn d(label: &str, c: f32, b: [f32; 4]) -> Detection {
-        Detection { label: label.into(), confidence: c, bbox: b }
+        Detection {
+            label: label.into(),
+            confidence: c,
+            bbox: b,
+        }
     }
 
     #[test]
@@ -80,7 +84,7 @@ mod tests {
             d("keys", 0.9, [0.0, 0.0, 10.0, 10.0]),
             d("keys", 0.6, [1.0, 1.0, 10.0, 10.0]), // overlaps heavily -> suppressed
             d("keys", 0.7, [50.0, 50.0, 60.0, 60.0]), // separate -> kept
-            d("bag", 0.8, [0.0, 0.0, 10.0, 10.0]), // different label -> kept
+            d("bag", 0.8, [0.0, 0.0, 10.0, 10.0]),  // different label -> kept
         ];
         let kept = nms(&dets, 0.5);
         assert_eq!(kept, vec![0, 3, 2]);

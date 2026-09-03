@@ -36,8 +36,11 @@ pub fn ingest_detections(
     nms_iou_threshold: f32,
     min_confidence: f32,
 ) -> Result<usize> {
-    let owned: Vec<Detection> =
-        dets.iter().filter(|d| d.confidence >= min_confidence).cloned().collect();
+    let owned: Vec<Detection> = dets
+        .iter()
+        .filter(|d| d.confidence >= min_confidence)
+        .cloned()
+        .collect();
     let keep = nms(&owned, nms_iou_threshold);
 
     let mut recorded = 0;

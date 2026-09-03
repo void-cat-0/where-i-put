@@ -7,19 +7,86 @@ use thiserror::Error;
 /// COCO 80-class labels, the vocabulary of stock Ultralytics exports
 /// (yolov8n/yolo11n ONNX). Index order is the model's class axis.
 pub const COCO_LABELS: &[&str] = &[
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
-    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
-    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep",
-    "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
-    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
-    "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
-    "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
-    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
-    "couch", "potted plant", "bed", "dining table", "toilet", "tv",
-    "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
-    "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
-    "scissors", "teddy bear", "hair drier", "toothbrush",
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "airplane",
+    "bus",
+    "train",
+    "truck",
+    "boat",
+    "traffic light",
+    "fire hydrant",
+    "stop sign",
+    "parking meter",
+    "bench",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "backpack",
+    "umbrella",
+    "handbag",
+    "tie",
+    "suitcase",
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "broccoli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
+    "dining table",
+    "toilet",
+    "tv",
+    "laptop",
+    "mouse",
+    "remote",
+    "keyboard",
+    "cell phone",
+    "microwave",
+    "oven",
+    "toaster",
+    "sink",
+    "refrigerator",
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
+    "toothbrush",
 ];
 
 #[derive(Debug, Error)]
@@ -37,7 +104,12 @@ pub trait Detector: Send {
 pub struct NullDetector;
 
 impl Detector for NullDetector {
-    fn detect(&self, _rgb: &[u8], _width: u32, _height: u32) -> Result<Vec<Detection>, DetectorError> {
+    fn detect(
+        &self,
+        _rgb: &[u8],
+        _width: u32,
+        _height: u32,
+    ) -> Result<Vec<Detection>, DetectorError> {
         Ok(vec![])
     }
 }
@@ -103,7 +175,7 @@ pub mod yolo {
                 self.input_size as u32,
                 image::imageops::FilterType::Triangle,
             );
-            let area = (self.input_size * self.input_size) as usize;
+            let area = self.input_size * self.input_size;
             let mut chw = vec![0f32; 3 * area];
             for (i, px) in resized.pixels().enumerate() {
                 chw[i] = px[0] as f32 / 255.0;
@@ -133,8 +205,11 @@ pub mod yolo {
             }
             let (dim1, dim2) = (dims[1], dims[2]);
             // attrs = the small dim (84), boxes = the large (8400)
-            let (n_attr, n_boxes, attrs_on_rows) =
-                if dim1 < dim2 { (dim1, dim2, true) } else { (dim2, dim1, false) };
+            let (n_attr, n_boxes, attrs_on_rows) = if dim1 < dim2 {
+                (dim1, dim2, true)
+            } else {
+                (dim2, dim1, false)
+            };
             let attr = |b: usize, a: usize| -> f32 {
                 if attrs_on_rows {
                     data[a * n_boxes + b]

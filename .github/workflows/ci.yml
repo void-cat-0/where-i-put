@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Default features: no native deps at all — the "fresh clone builds green"
+  # guarantee, plus lint gates.
+  default:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  # Per-optional-backend compile checks on Linux (ubuntu has apt for libclang;
+  # nokhwa compiles against V4L2 headers without a camera present).
+  features:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [camera, yolo, "yolo,camera"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --features "${{ matrix.features }}" -- -D warnings
+      - run: cargo test --workspace --features "${{ matrix.features }}"
+
+  # rtsp (ffmpeg-next) via the prebuilt-zip path on Linux and Windows,
+  # exactly like a contributor would: `cargo xtask setup` downloads the
+  # sha256-pinned BtbN archive + libclang wheel, then build/test.
+  rtsp-zip:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: libclang + ffmpeg deps (linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask setup
+      - run: cargo xtask status
+      - run: cargo test --workspace --features rtsp
+
+  # rtsp built from source --from-source (the real happy-path validation for
+  # that flag; needs sh/make/nasm, MSVC cl.exe + libclang on Windows).
+  # macOS included: BtbN ships no mac zip, source build is the mac route.
+  rtsp-source:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: posix build tools (linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev nasm make
+      - name: posix build tools (macos)
+        if: matrix.os == 'macos-latest'
+        run: brew install nasm make llvm
+      - name: point bindgen at brew llvm (macos; config.toml force=false lets this win)
+        if: matrix.os == 'macos-latest'
+        run: echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+      - name: posix build tools (windows via MSYS2 sh/make/nasm/perl, keep cl.exe winning)
+        if: matrix.os == 'windows-latest'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: make nasm perl
+          path: false
+      - name: MSVC developer environment (windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: prepend msys usr/bin after MSVC env (windows)
+        if: matrix.os == 'windows-latest'
+        run: echo "C:\msys64\usr\bin" >> "$GITHUB_PATH"
+        shell: bash
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build ffmpeg from source
+        run: cargo xtask setup --from-source
+      - name: build + test against source tree
+        run: cargo test --workspace --features rtsp
