@@ -133,10 +133,11 @@ jobs:
       - name: dump source tree layout
         shell: bash
         run: |
-          echo "=== top ==="; ls target/vendor/ffmpeg
-          echo "=== include dirs ==="; ls target/vendor/ffmpeg/include 2>/dev/null
-          echo "=== lib sample ==="; ls target/vendor/ffmpeg/lib 2>/dev/null | head -20
-          echo "=== bin sample ==="; ls target/vendor/ffmpeg/bin 2>/dev/null | head -10
+          echo "=== top ==="; ls target/vendor/ffmpeg || true
+          echo "=== include dirs ==="; ls target/vendor/ffmpeg/include 2>/dev/null || true
+          echo "=== lib sample ==="; ls target/vendor/ffmpeg/lib 2>/dev/null | head -20 || true
+          echo "=== bin sample (source installs .so into lib; only zip has bin) ==="
+          ls target/vendor/ffmpeg/bin 2>/dev/null | head -10 || true
       - name: test against source tree
         shell: bash
         run: |
