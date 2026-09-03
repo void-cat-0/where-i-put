@@ -464,12 +464,20 @@ fn build_from_source(root: &Path) -> Result<()> {
     }
     fs::create_dir_all(&prefix)?;
 
-    // FFmpeg's configure writes into the source tree and installs to a
-    // prefix; on Windows it wants forward slashes for the --prefix path.
+    // --prefix MUST be absolute: configure/make run with cwd = the source
+    // tree, so a relative prefix installs into ffmpeg-7.1.5/target/... and
+    // exits 0 -- into the tree we delete afterwards (run 8: prefix contained
+    // only our manifest.json). current_dir-join, not canonicalize (no \\?\
+    // verbatim prefixes for sh to choke on). Windows wants forward slashes.
+    let prefix_abs = if prefix.is_absolute() {
+        prefix.clone()
+    } else {
+        std::env::current_dir().context("resolving cwd")?.join(&prefix)
+    };
     let mut cfg_args: Vec<String> = SRC_CONFIGURE.iter().map(|s| s.to_string()).collect();
     cfg_args.push(format!(
         "--prefix={}",
-        prefix.display().to_string().replace('\\', "/")
+        prefix_abs.display().to_string().replace('\\', "/")
     ));
     if cfg!(windows) {
         cfg_args.push("--toolchain=msvc".into());
