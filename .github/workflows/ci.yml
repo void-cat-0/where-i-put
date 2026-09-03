@@ -14,8 +14,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# On failure we tee the command output and re-emit the tail as `::error::`
-# annotations -- job logs need repo auth to download, annotations are public.
+# Failure tails are re-emitted as ::error:: annotations (job logs need repo
+# auth; annotations are public). All shell-scripted steps pin `shell: bash`
+# because windows runners default to pwsh.
 jobs:
   default:
     runs-on: ubuntu-latest
@@ -27,15 +28,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - name: clippy
+        shell: bash
         run: |
           set -o pipefail
           cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee clippy.log || {
-            tail -40 clippy.log | sed 's/^/::error::/' ; exit 1; }
+            grep -iE "^(error|warning)" clippy.log | head -25 | sed 's/^/::error::/'
+            tail -25 clippy.log | sed 's/^/::error::/' ; exit 1; }
       - name: test
+        shell: bash
         run: |
           set -o pipefail
           cargo test --workspace 2>&1 | tee test.log || {
-            tail -40 test.log | sed 's/^/::error::/' ; exit 1; }
+            grep -iE "^error|panicked|FAILED" test.log | head -25 | sed 's/^/::error::/'
+            tail -25 test.log | sed 's/^/::error::/' ; exit 1; }
 
   features:
     runs-on: ubuntu-latest
@@ -48,18 +53,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      # libclang-dev for bindgen (rtsp/yolo side); libv4l-dev because nokhwa's
+      # linux input backend builds v4l2-sys-mit against kernel media headers.
+      - run: sudo apt-get update && sudo apt-get install -y libclang-dev libv4l-dev
       - uses: Swatinem/rust-cache@v2
       - name: clippy
+        shell: bash
         run: |
           set -o pipefail
           cargo clippy --workspace --all-targets --features "${{ matrix.features }}" -- -D warnings 2>&1 | tee clippy.log || {
-            tail -40 clippy.log | sed 's/^/::error::/' ; exit 1; }
+            grep -iE "^error|failed" clippy.log | head -25 | sed 's/^/::error::/'
+            tail -25 clippy.log | sed 's/^/::error::/' ; exit 1; }
       - name: test
+        shell: bash
         run: |
           set -o pipefail
           cargo test --workspace --features "${{ matrix.features }}" 2>&1 | tee test.log || {
-            tail -40 test.log | sed 's/^/::error::/' ; exit 1; }
+            grep -iE "^error|panicked|FAILED" test.log | head -25 | sed 's/^/::error::/'
+            tail -25 test.log | sed 's/^/::error::/' ; exit 1; }
 
   rtsp-zip:
     strategy:
@@ -75,59 +86,43 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libclang-dev
       - uses: Swatinem/rust-cache@v2
       - name: xtask setup (pinned zip path)
+        shell: bash
         run: |
           set -o pipefail
           cargo xtask setup 2>&1 | tee setup.log || {
-            tail -40 setup.log | sed 's/^/::error::/' ; exit 1; }
+            grep -iE "^error|mismatch|failed|GET " setup.log | head -25 | sed 's/^/::error::/'
+            tail -30 setup.log | sed 's/^/::error::/' ; exit 1; }
       - run: cargo xtask status
       - name: test
+        shell: bash
         run: |
           set -o pipefail
           cargo test --workspace --features rtsp 2>&1 | tee test.log || {
-            tail -60 test.log | sed 's/^/::error::/' ; exit 1; }
+            grep -iE "^error|panicked|FAILED" test.log | head -30 | sed 's/^/::error::/'
+            tail -30 test.log | sed 's/^/::error::/' ; exit 1; }
 
+  # from-source builds of pinned FFmpeg. Linux only for now: Windows needs a
+  # proven MSVC+MSYS2 configure handshake, macOS needs the brew/trust and
+  # zip-conflict design pass (see README).
   rtsp-source:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - name: linux deps
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev nasm make
-      - name: macos deps
-        if: matrix.os == 'macos-latest'
-        run: brew install nasm make llvm
-      - name: macos libclang path (config.toml force=false lets this win)
-        if: matrix.os == 'macos-latest'
-        run: echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
-      - name: windows msys2 tools (path:false keeps cl.exe winning over msys gcc)
-        if: matrix.os == 'windows-latest'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: make nasm perl
-          path: false
-      - name: windows MSVC developer env
-        if: matrix.os == 'windows-latest'
-        uses: ilammy/msvc-dev-cmd@v1
-      - name: windows add msys usr/bin (after msvc env so cl wins)
-        if: matrix.os == 'windows-latest'
-        run: echo "C:\\msys64\\usr\\bin" >> "$GITHUB_PATH"
-        shell: bash
+      - run: sudo apt-get update && sudo apt-get install -y libclang-dev nasm make
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: build ffmpeg from source (tail on failure)
+      - name: build ffmpeg from source
+        shell: bash
         run: |
           set -o pipefail
           cargo xtask setup --from-source 2>&1 | tee source-build.log || {
-            tail -60 source-build.log | sed 's/^/::error::/' ; exit 1; }
+            grep -iE "^error|failed|cannot|No such|not found" source-build.log | head -30 | sed 's/^/::error::/'
+            tail -40 source-build.log | sed 's/^/::error::/' ; exit 1; }
       - name: test against source tree
+        shell: bash
         run: |
           set -o pipefail
           cargo test --workspace --features rtsp 2>&1 | tee test.log || {
-            tail -60 test.log | sed 's/^/::error::/' ; exit 1; }
+            grep -iE "^error|panicked|FAILED" test.log | head -30 | sed 's/^/::error::/'
+            tail -40 test.log | sed 's/^/::error::/' ; exit 1; }
