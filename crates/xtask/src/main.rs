@@ -403,18 +403,29 @@ fn require_build_tools() -> Result<()> {
 /// Components we actually use (RTSP pull -> H.264/HEVC decode -> swscale
 /// RGB), mirroring prpr-avc-ffmpeg's `--disable-everything` + whitelist shape,
 /// minus their Hz custom op and plus the live-streaming stack they don't need.
-/// We build SHARED deliberately: it keeps the FFMPEG_DIR contract identical to
-/// the zip path (include/ + lib/ import libs + bin/ DLLs), so build.rs DLL
-/// staging and ffmpeg-sys-next's default dynamic linking both keep working
-/// with no extra cargo features. (A `--static` output mode would need the
-/// matching static feature on ffmpeg-next — wire that up in CI later.)
+/// IMPORTANT: `--disable-everything` disables the LIBRARIES too -- enabling a
+/// decoder does not re-enable libavcodec. Every library ffmpeg-sys-next may
+/// probe (per cargo features of consumers) is therefore enabled explicitly:
+/// all six, matching the BtbN zip's header set, so both zip- and
+/// source-flavored FFMPEG_DIR trees satisfy the build.rs check.c probe
+/// (run 5: source tree died at "Compile failed" precisely because the
+/// minimal whitelist left some library headers uninstalled).
+/// Shared build keeps the FFMPEG_DIR contract identical to the zip path
+/// (include/ + lib/ import libs + bin/ DLLs); a static flavor would need
+/// ffmpeg-next's static feature too -- deferred.
 const SRC_CONFIGURE: &[&str] = &[
     "--disable-everything",
     "--disable-programs",
     "--disable-doc",
     "--disable-debug",
     "--disable-autodetect",
+    "--enable-gpl",
     "--enable-shared",
+    // all six libraries, explicitly
+    "--enable-avcodec",
+    "--enable-avformat",
+    "--enable-avdevice",
+    "--enable-avfilter",
     "--enable-swscale",
     "--enable-swresample",
     "--enable-network",
@@ -424,6 +435,8 @@ const SRC_CONFIGURE: &[&str] = &[
     "--enable-parser=h264,hevc,mpeg4video,mpegaudio,ac3",
     "--enable-protocol=rtsp,tcp,udp,rtp,file",
     "--enable-filter=scale",
+    "--enable-indev=lavfi",
+    "--enable-outdev=null",
 ];
 
 /// Build FFmpeg from the pinned upstream tarball into target/vendor/ffmpeg/

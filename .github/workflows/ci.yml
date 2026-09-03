@@ -130,10 +130,18 @@ jobs:
           cargo xtask setup --from-source 2>&1 | tee source-build.log || {
             grep -iE "^error|failed|cannot|No such|not found" source-build.log | head -30 | sed 's/^/::error::/'
             tail -40 source-build.log | sed 's/^/::error::/' ; exit 1; }
+      - name: dump source tree layout
+        shell: bash
+        run: |
+          echo "=== top ==="; ls target/vendor/ffmpeg
+          echo "=== include dirs ==="; ls target/vendor/ffmpeg/include 2>/dev/null
+          echo "=== lib sample ==="; ls target/vendor/ffmpeg/lib 2>/dev/null | head -20
+          echo "=== bin sample ==="; ls target/vendor/ffmpeg/bin 2>/dev/null | head -10
       - name: test against source tree
         shell: bash
         run: |
           set -o pipefail
           cargo test --workspace --features rtsp 2>&1 | tee test.log || {
-            grep -iE "^error|panicked|FAILED" test.log | head -30 | sed 's/^/::error::/'
-            tail -40 test.log | sed 's/^/::error::/' ; exit 1; }
+            # gcc/cl error lines are prefixed by file:line:, so don't anchor ^
+            grep -aiE "fatal error|no such file|undefined reference|cannot find|error\[|panicked|FAILED" test.log | head -25 | sed 's/^/::error::/'
+            tail -30 test.log | sed 's/^/::error::/' ; exit 1; }
