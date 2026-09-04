@@ -62,7 +62,7 @@ pub fn ingest_detections(
     };
 
     let mut recorded = 0;
-    for idx in keep {
+    for (hi, idx) in keep.into_iter().enumerate() {
         let det = &owned[idx];
         let zone = store.zone_for_point(&meta.camera_id, det.center())?;
         let (id, is_new) = store.record_sighting(
@@ -74,9 +74,10 @@ pub fn ingest_detections(
             item_core::store::DEFAULT_DEDUP_WINDOW,
         )?;
         // A failed snapshot must not break ingestion; also only the FIRST
-        // sighting of an observation gets an image.
+        // sighting of an observation gets an image -- and that image is
+        // re-rendered per row, so each one highlights THIS row's box.
         if is_new && let Some((rgb, dir)) = frame_rgb {
-            match annotate::annotate(rgb, meta.width, meta.height, &survivors, &regions) {
+            match annotate::annotate(rgb, meta.width, meta.height, &survivors, &regions, Some(hi)) {
                 Some(img) => match write_snapshot(dir, id, &img) {
                     Ok(rel) => store.set_sample_snapshot(id, &rel)?,
                     Err(e) => tracing::warn!(error = %e, obs = id, "snapshot write failed"),

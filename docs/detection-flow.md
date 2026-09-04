@@ -16,7 +16,8 @@ RTSP (1280x720 @25fps)
   → zone_for_point            框【中心点】落在哪个区域矩形 → zone 名，否则 "frame"
   → record_sighting           合并进活跃 observation 或 INSERT 新行，返回 (id, is_new)
   → is_new 时                 标注帧 JPEG 写 data/snapshots/{id}.jpg，路径回填该行
-                              （烧入：本帧全部 NMS 存活框按 label 着色 + 区域灰虚线）
+                              （烧入：本帧全部 NMS 存活框按 label 着色 + 灰虚线区域；
+                               本行的框加粗 + 白外圈，每框带 "label conf" 色块标签）
 ```
 
 三个进程/端口相互独立：`item-ingest --rtsp`（写库）、`item-ingest --preview`
@@ -68,8 +69,11 @@ CREATE TABLE regions (id, camera_id, name, x0, y0, x1, y1, UNIQUE(camera_id,name
    所以 UI 上同一物体可能出现多张卡（不同时段），这是特性不是重复 bug。
 3. **快照每行只有一张，内容 = 该行诞生那一刻的画面（带烧入标注）**，此后永不更新。
    对着 last_seen 很新但图是"刚出现时"的情况不必惊讶。标注画的是**出生帧全部**
-   存活检测框（同 label 多框都会画出来——这正是 hits 超速增长的视觉解释），外加
-   该相机所有配置区域的灰色虚线矩形；实现在 `item-ingest/src/annotate.rs`。
+   存活检测框（细线 + 小色块标签；同 label 多框都会画出来——这正是 hits 超速增长
+   的视觉解释），外加该相机所有配置区域的灰色虚线矩形；**唯独本行的那个框**被
+   高亮（加粗描边 + 白色外圈 + 大号 "label conf" 色块）。高亮是逐行渲染的——
+   同帧诞生 5 行就渲染 5 份、各亮各的框，所以**同帧的快照文件也互不相同**
+   （底图相同、唯一的粗白圈不同）。实现在 `item-ingest/src/annotate.rs`。
 4. **zone 由中心点单点判定**：一个框永远只属于一个 zone。人从 desk 区走到
    upper 区会分裂成两条 observation（各自计数、各自快照）。
 5. **重叠抑制**：同一物体的多个冗余框在 NMS（同 label IoU>0.45）后只记一次，
@@ -162,7 +166,8 @@ CREATE TABLE regions (id, camera_id, name, x0, y0, x1, y1, UNIQUE(camera_id,name
   下启动即无此问题。
 - **标注是烧进像素的，UI 无法关框/换框**：框数据不落库（设计上不存逐帧检测），
   所以老快照（该特性之前写的）不会有框，`frigate://` 引用图也不归我们画。
-  同一帧里诞生的多个 observation 共享逐像素相同的图，卡片别当重复 bug。
+  同一帧里诞生的多个 observation 底图相同、但**各高亮自己的框，文件互不相同**
+  （逐行渲染所致，别当重复 bug）。
 - **时间全为 UTC**：UI 里浏览器会转成本地时区显示（`toLocaleString`/相对
   时间），db 原文是 `+00:00`，比对时差 8 小时（东八区）属正常。
 - **一次检测可产多行**：一帧里 N 个框各归各的 zone/label，`recorded=M` 打印

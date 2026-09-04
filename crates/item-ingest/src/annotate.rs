@@ -95,25 +95,128 @@ pub fn draw_rect_dashed(img: &mut image::RgbImage, rect: [f32; 4], color: image:
     }
 }
 
-/// Annotate a copy of one decoded frame: zone rectangles first (dashed gray),
-/// then every surviving detection box of that frame in its label's color --
-/// including duplicates of one object (they are exactly what makes a row's
-/// hit_count race ahead of the frame counter, and one glance should explain
-/// it). `None` if the buffer is shorter than the frame.
+/// Ring drawn around the row's own box so it pops off the frame.
+pub const WHITE_RING: image::Rgb<u8> = image::Rgb([255, 255, 255]);
+
+/// "label conf" -- the chip text for one detection.
+pub fn label_text(d: &Detection) -> String {
+    format!("{} {:.2}", d.label, d.confidence)
+}
+
+/// Draw ASCII text in the public-domain IBM VGA 8x8 font (`font8x8`),
+/// magnified `scale`x; returns the pixel width drawn. Out-of-frame glyph
+/// pixels are clipped, not panicked on.
+pub fn draw_text(
+    img: &mut image::RgbImage,
+    x: u32,
+    y: u32,
+    text: &str,
+    color: image::Rgb<u8>,
+    scale: u32,
+) -> u32 {
+    use font8x8::UnicodeFonts;
+    let scale = scale.max(1);
+    let put = |img: &mut image::RgbImage, x: u32, y: u32| {
+        if x < img.width() && y < img.height() {
+            img.put_pixel(x, y, color);
+        }
+    };
+    for (ci, ch) in text.chars().enumerate() {
+        let ch = if ch.is_ascii() { ch } else { '?' };
+        let Some(glyph) = font8x8::BASIC_FONTS.get(ch) else {
+            continue;
+        };
+        let gx = x + ci as u32 * 8 * scale;
+        for (row, &bits) in glyph.iter().enumerate() {
+            for col in 0..8u32 {
+                // font8x8 is LSB-first: bit 0 is the LEFTMOST pixel (matches
+                // the crate's own print_set renderer).
+                if bits & (1 << col) != 0 {
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            put(img, gx + col * scale + dx, y + row as u32 * scale + dy);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    text.chars().count() as u32 * 8 * scale
+}
+
+/// Ultralytics-style chip: label-colored plate with black text, anchored to
+/// a detection's top-left corner `lift`px above it (highlighted rows lift it
+/// past their white ring). Flips INSIDE the box when there is no room above.
+pub fn draw_label(img: &mut image::RgbImage, d: &Detection, scale: u32, lift: u32) {
+    let text = label_text(d);
+    let scale = scale.max(1);
+    let pad = scale;
+    let tw = text.chars().count() as u32 * 8 * scale;
+    let (pw, ph) = (tw + 2 * pad, 8 * scale + 2 * pad);
+    let (x0, y0, _x1, y1) = match clamp_rect(img, d.bbox) {
+        Some(r) => r,
+        None => return,
+    };
+    let y0 = y0.saturating_sub(lift);
+    let (px, py) = match y0.checked_sub(ph) {
+        Some(y) => (x0, y),
+        None => (x0, y1.saturating_sub(ph)), // no room above: sit inside
+    };
+    for x in px..(px + pw).min(img.width()) {
+        for y in py..(py + ph).min(img.height()) {
+            img.put_pixel(x, y, palette_color(&d.label));
+        }
+    }
+    draw_text(img, px + pad, py + pad, &text, image::Rgb([0, 0, 0]), scale);
+}
+
+/// Annotated copy of one decoded frame:
+/// - zone rects: dashed gray,
+/// - every other surviving detection of that frame: 1px label-colored rect
+///   with an "label conf" chip (thin chips keep the frame readable),
+/// - `highlight` (index into `survivors` -- the row being born): thick
+///   label-colored rect, a white outer ring, and a larger chip.
+///
+/// The highlight MUST differ per row even when many rows share one birth
+/// frame: each new observation renders its own copy of the frame here.
+/// Duplicates of one object are still drawn (they explain hit_count races).
+/// Returns `None` if the buffer is shorter than the frame.
 pub fn annotate(
     rgb: &[u8],
     w: u32,
     h: u32,
     survivors: &[&Detection],
     regions: &[Region],
+    highlight: Option<usize>,
 ) -> Option<image::RgbImage> {
     let mut img = image::RgbImage::from_raw(w, h, rgb.to_vec())?;
     for rg in regions {
         draw_rect_dashed(&mut img, rg.rect, REGION_COLOR);
     }
     let t = box_thickness(h);
-    for d in survivors {
-        draw_rect(&mut img, d.bbox, palette_color(&d.label), t);
+    let hl = highlight.filter(|i| *i < survivors.len());
+
+    for (i, d) in survivors.iter().enumerate() {
+        if hl == Some(i) {
+            continue;
+        }
+        draw_rect(&mut img, d.bbox, palette_color(&d.label), 1);
+        draw_label(&mut img, d, 1, 0);
+    }
+    if let Some(i) = hl {
+        let d = survivors[i];
+        let color = palette_color(&d.label);
+        // white ring hugging the box from outside
+        let g = 2 * t;
+        let ring = [
+            d.bbox[0] - g as f32,
+            d.bbox[1] - g as f32,
+            d.bbox[2] + g as f32,
+            d.bbox[3] + g as f32,
+        ];
+        draw_rect(&mut img, ring, WHITE_RING, t);
+        draw_rect(&mut img, d.bbox, color, t + 1);
+        draw_label(&mut img, d, t + 1, g);
     }
     Some(img)
 }
@@ -210,7 +313,7 @@ mod tests {
             name: "desk".into(),
             rect: [4.0, 4.0, 44.0, 44.0],
         };
-        let out = annotate(&rgb, 64, 48, &[&d], std::slice::from_ref(&region)).unwrap();
+        let out = annotate(&rgb, 64, 48, &[&d], std::slice::from_ref(&region), None).unwrap();
         // box top edge: box color wins over the dashed region line
         assert_eq!(*out.get_pixel(24, 8), palette_color("bottle"));
         // region top edge at a dash-on offset, away from the box
@@ -221,6 +324,85 @@ mod tests {
 
     #[test]
     fn annotate_rejects_short_buffer() {
-        assert!(annotate(&[0u8; 3], 64, 48, &[], &[]).is_none());
+        assert!(annotate(&[0u8; 3], 64, 48, &[], &[], None).is_none());
+    }
+
+    // font8x8 is LSB-first (bit 0 = leftmost). 'F' is the discriminator:
+    // correct order puts the stem on the LEFT and bars extend right; a
+    // reversed (MSB) bug would mirror it. 'A' just checks advance width.
+    #[test]
+    fn draw_text_renders_readable_glyphs() {
+        let mut img = blank(40, 10);
+        let white = image::Rgb([255, 255, 255]);
+        assert_eq!(draw_text(&mut img, 0, 0, "A", white, 1), 8);
+        assert_eq!(draw_text(&mut img, 0, 0, "ABC", white, 1), 24);
+
+        let mut f = blank(16, 10);
+        draw_text(&mut f, 0, 0, "F", white, 1);
+        // VGA 'F' puts its stem at columns 1-2 with bars extending right;
+        // a mirrored (MSB-read) bug would move the stem to the right side.
+        let stem_left = (1..7).filter(|y| *f.get_pixel(1, *y) == white).count();
+        let stem_right = (3..7).filter(|y| *f.get_pixel(5, *y) == white).count();
+        assert!(
+            stem_left >= 4,
+            "'F' stem should hug the left side, got {stem_left}"
+        );
+        assert_eq!(stem_right, 0, "ink in the right column = mirrored glyph");
+    }
+
+    #[test]
+    fn draw_text_scales_and_clips() {
+        let mut img = blank(30, 30);
+        let red = image::Rgb([255, 0, 0]);
+        assert_eq!(
+            draw_text(&mut img, 2, 2, "F", red, 3),
+            24,
+            "scale 3 -> 24px advance"
+        );
+        assert!(
+            (0..24).any(|x| *img.get_pixel(2 + x, 2) == red),
+            "scale-3 bar present"
+        );
+        // far-right draw must clip without panicking
+        draw_text(&mut img, 28, 0, "F", red, 3);
+    }
+
+    #[test]
+    fn highlight_rings_only_its_own_box() {
+        let d1 = det("bottle", [10.0, 10.0, 30.0, 30.0]);
+        let d2 = det("bottle", [50.0, 50.0, 80.0, 80.0]);
+        let dets = [&d1, &d2];
+        let rgb = vec![0u8; 100 * 100 * 3];
+        let out = annotate(&rgb, 100, 100, &dets, &[], Some(1)).unwrap();
+        // White pixels are ONLY ever produced by the ring, so counting them
+        // per neighborhood proves d2 is ringed and d1 is not -- regardless
+        // of where the (pink/black) chips happen to land.
+        let whites = |x0: u32, y0: u32, x1: u32, y1: u32| -> u32 {
+            (x0..=x1)
+                .flat_map(|x| (y0..=y1).map(move |y| (x, y)))
+                .filter(|(x, y)| *out.get_pixel(*x, *y) == WHITE_RING)
+                .count() as u32
+        };
+        assert_eq!(whites(0, 0, 44, 44), 0, "non-highlighted d1 gets no ring");
+        // ring perimeter at [48..82]^2 is ~136 px; require most of it:
+        assert!(whites(44, 44, 84, 84) > 120, "highlighted d2 is ringed");
+    }
+
+    #[test]
+    fn every_row_shares_one_frame_but_highlights_its_own_box() {
+        let d1 = det("cup", [10.0, 10.0, 30.0, 30.0]);
+        let d2 = det("chair", [50.0, 50.0, 70.0, 70.0]);
+        let dets = [&d1, &d2];
+        let rgb = vec![128u8; 90 * 90 * 3];
+        let a = annotate(&rgb, 90, 90, &dets, &[], Some(0)).unwrap();
+        let b = annotate(&rgb, 90, 90, &dets, &[], Some(1)).unwrap();
+        assert_ne!(a, b, "same frame, different rows must not share a file");
+        // ring presence flips with the highlight:
+        let ring_at = |img: &image::RgbImage, x: u32, y: u32| {
+            (x..x + 4).any(|cx| (y..y + 4).any(|cy| *img.get_pixel(cx, cy) == WHITE_RING))
+        };
+        assert!(ring_at(&a, 6, 6), "a rings the cup box");
+        assert!(!ring_at(&b, 6, 6), "b must not ring the cup box");
+        assert!(ring_at(&b, 46, 46), "b rings the chair box");
     }
 }

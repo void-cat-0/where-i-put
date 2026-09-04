@@ -17,6 +17,7 @@ image.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 toml = "1"
+font8x8 = "0.3.1"
 
 # Optional backends, off by default so the skeleton builds without native deps:
 # - ort: ONNX Runtime for real YOLO inference; auto-downloads onnxruntime at
