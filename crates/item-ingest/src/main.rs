@@ -44,21 +44,29 @@ struct Args {
     #[arg(long)]
     rtsp: Option<String>,
 
-    /// Camera id to attribute --rtsp frames to.
-    #[cfg(feature = "rtsp")]
+    /// Camera id to attribute --rtsp/--webcam frames to.
+    #[cfg(any(feature = "rtsp", feature = "camera"))]
     #[arg(long, default_value = "rtsp-0")]
     camera_id: String,
 
-    /// Max frames to ingest from --rtsp before exiting (0 = run until EOF).
-    #[cfg(feature = "rtsp")]
+    /// Max frames to ingest from --rtsp/--webcam before exiting
+    /// (0 = run forever; RTSP also stops at stream EOF).
+    #[cfg(any(feature = "rtsp", feature = "camera"))]
     #[arg(long, default_value_t = 0)]
     frames: u64,
 
-    /// How often to run detection on the stream (decode runs at stream rate;
-    /// only detected frames can create observations/snapshots).
-    #[cfg(feature = "rtsp")]
+    /// How often to run detection on the stream (decode/capture runs at
+    /// stream rate; only detected frames can create observations/snapshots).
+    #[cfg(any(feature = "rtsp", feature = "camera"))]
     #[arg(long, default_value_t = 1.0)]
     detect_fps: f64,
+
+    /// Built-in/USB webcam index for the same ingest loop (requires
+    /// `--features camera`; combine with `yolo` for real detections).
+    /// 0 is the integrated camera on most machines.
+    #[cfg(feature = "camera")]
+    #[arg(long)]
+    webcam: Option<u32>,
 
     /// Serve a web MJPEG preview of this RTSP url at GET /preview
     /// (requires `--features rtsp`). Credentials in the url are kept out of logs.
@@ -128,6 +136,11 @@ fn main() -> anyhow::Result<()> {
         return rtsp_pass(&store, &args, url);
     }
 
+    #[cfg(feature = "camera")]
+    if let Some(index) = args.webcam {
+        return webcam_pass(&store, &args, index);
+    }
+
     let state: item_ingest::frigate::State = Arc::new(Mutex::new(store));
     let app = item_ingest::frigate::router(state);
 
@@ -162,7 +175,7 @@ fn main() -> anyhow::Result<()> {
 
 /// The detector for the camera loop: real YOLO when built with `yolo`,
 /// otherwise Null (pipeline still exercises, but records nothing).
-#[cfg(all(feature = "rtsp", feature = "yolo"))]
+#[cfg(all(feature = "yolo", any(feature = "rtsp", feature = "camera")))]
 fn build_detector(args: &Args) -> anyhow::Result<Box<dyn Detector>> {
     use item_ingest::detector::COCO_LABELS;
     use item_ingest::detector::yolo::YoloDetector;
@@ -178,7 +191,7 @@ fn build_detector(args: &Args) -> anyhow::Result<Box<dyn Detector>> {
     Ok(Box::new(det))
 }
 
-#[cfg(all(feature = "rtsp", not(feature = "yolo")))]
+#[cfg(all(not(feature = "yolo"), any(feature = "rtsp", feature = "camera")))]
 fn build_detector(_args: &Args) -> anyhow::Result<Box<dyn Detector>> {
     tracing::warn!(
         "built without 'yolo' feature: camera loop runs NullDetector (no observations); \
@@ -289,25 +302,33 @@ fn detect_pass(
     Ok(())
 }
 
-/// The closed loop: RTSP frames are decoded continuously (and cheaply
-/// dropped), detection runs at --detect-fps, surviving hits become zone-
-/// mapped observations whose first sighting gets a snapshot JPEG. Reconnects
-/// forever, like preview does.
-#[cfg(feature = "rtsp")]
-fn rtsp_pass(store: &Store, args: &Args, url: &str) -> anyhow::Result<()> {
+/// The shared camera loop behind --rtsp/--webcam: frames are pulled at the
+/// source's rate (and cheaply dropped), detection runs at --detect-fps,
+/// surviving hits become zone-mapped observations whose first sighting gets
+/// an annotated snapshot JPEG. On EOF/source error, restarts the source
+/// forever after 2s -- like preview does.
+///
+/// Threading: `make_source` and every `next_frame` call happen on THIS
+/// thread, which nokhwa's COM-affine camera requires (see source::nokhwa).
+#[cfg(any(feature = "rtsp", feature = "camera"))]
+fn camera_pump(
+    store: &Store,
+    args: &Args,
+    detector: &dyn Detector,
+    kind: &str,
+    source_desc: &str,
+    make_source: &mut dyn FnMut() -> anyhow::Result<Box<dyn FrameSource>>,
+) -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 
-    use item_ingest::source::rtsp::RtspSource;
-
-    let detector = build_detector(args)?;
-    let snaps = std::path::PathBuf::from(&args.snapshots_dir);
+    let snaps = Path::new(&args.snapshots_dir);
     let interval = Duration::from_secs_f64(1.0 / args.detect_fps.max(0.05));
     let mut last_detect = Instant::now() - interval;
     let mut frames = 0u64;
     let mut detected = 0u64;
     loop {
-        tracing::info!(target_url = redact_url(url), "opening rtsp stream");
-        let mut source = match RtspSource::new(&args.camera_id, url) {
+        tracing::info!(source = %source_desc, "opening {kind} source");
+        let mut source = match make_source() {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "connect failed, retrying in 2s");
@@ -318,7 +339,7 @@ fn rtsp_pass(store: &Store, args: &Args, url: &str) -> anyhow::Result<()> {
         loop {
             if args.frames > 0 && frames >= args.frames {
                 println!(
-                    "ingested {frames} rtsp frames ({detected} detections) from {}",
+                    "ingested {frames} {kind} frames ({detected} detections) from {}",
                     args.camera_id
                 );
                 return Ok(());
@@ -330,7 +351,7 @@ fn rtsp_pass(store: &Store, args: &Args, url: &str) -> anyhow::Result<()> {
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "stream error, reconnecting");
+                    tracing::warn!(error = %e, "source error, reconnecting");
                     break;
                 }
             };
@@ -349,7 +370,7 @@ fn rtsp_pass(store: &Store, args: &Args, url: &str) -> anyhow::Result<()> {
                 &dets,
                 0.45,
                 0.0, // detector already floors at conf
-                Some((&frame.rgb, snaps.as_path())),
+                Some((&frame.rgb, snaps)),
             )?;
             if recorded > 0 {
                 tracing::info!(frames, recorded, "detections ingested");
@@ -357,4 +378,43 @@ fn rtsp_pass(store: &Store, args: &Args, url: &str) -> anyhow::Result<()> {
         }
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+/// Closed loop over an RTSP stream (reconnecting forever).
+#[cfg(feature = "rtsp")]
+fn rtsp_pass(store: &Store, args: &Args, url: &str) -> anyhow::Result<()> {
+    use item_ingest::source::rtsp::RtspSource;
+
+    let detector = build_detector(args)?;
+    let mut open = || -> anyhow::Result<Box<dyn FrameSource>> {
+        Ok(Box::new(RtspSource::new(&args.camera_id, url)?))
+    };
+    camera_pump(
+        store,
+        args,
+        detector.as_ref(),
+        "rtsp",
+        &redact_url(url),
+        &mut open,
+    )
+}
+
+/// Closed loop over a local webcam (nokhwa; no FFmpeg needed). A dead or
+/// busy camera surfaces as a source error, so the loop keeps retrying.
+#[cfg(feature = "camera")]
+fn webcam_pass(store: &Store, args: &Args, index: u32) -> anyhow::Result<()> {
+    use item_ingest::source::nokhwa::NokhwaSource;
+
+    let detector = build_detector(args)?;
+    let mut open = || -> anyhow::Result<Box<dyn FrameSource>> {
+        Ok(Box::new(NokhwaSource::new(args.camera_id.clone(), index)))
+    };
+    camera_pump(
+        store,
+        args,
+        detector.as_ref(),
+        "webcam",
+        &format!("#{index}"),
+        &mut open,
+    )
 }

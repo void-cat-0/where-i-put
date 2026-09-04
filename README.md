@@ -12,9 +12,9 @@ Crates, one-way dependencies (`item-ingest`/`item-query`/`item-web` -> `item-cor
   `Region`), box geometry (IoU, greedy NMS), SQLite storage. The unit of truth
   is the *Observation*: "label X was in zone Z of camera C during \[first_seen,
   last_seen]", merged while sightings stay within a 5-min dedup window.
-- **crates/item-ingest** — the write side. `FrameSource` (Mock now, nokhwa
-  for USB webcams behind `--features camera`, ffmpeg-next for RTSP/IP cameras
-  behind `--features rtsp`) -> `Detector` (Null without features; real
+- **crates/item-ingest** — the write side. `FrameSource` (Mock; USB/built-in
+  webcams via nokhwa behind `--features camera`; RTSP/IP cameras via
+  ffmpeg-next behind `--features rtsp`) -> `Detector` (Null without features; real
   YOLOv8-onnx behind `--features yolo` via ort) -> NMS -> zone mapping -> store. Also an
   axum webhook server that ingests Frigate events directly, skipping local
   detection entirely, plus an MJPEG web preview bridge for RTSP cameras
@@ -39,6 +39,9 @@ cargo run -p item-ingest -- --demo
 
 # RTSP camera (one-time: `cargo xtask setup` to fetch FFmpeg + libclang)
 cargo run --features rtsp -p item-ingest -- --rtsp "rtsp://user:pass@192.168.1.50:554/Streaming/Channels/101" --camera-id living
+
+# Built-in/USB webcam: same closed loop WITHOUT FFmpeg/native setup
+cargo run --features "camera,yolo" -p item-ingest -- --webcam 0 --camera-id laptop --detect-fps 2
 
 # live web preview (MJPEG bridge; browsers can't speak RTSP) — open http://<host>:8477/preview
 cargo run --features rtsp -p item-ingest -- --preview "rtsp://user:pass@192.168.1.50:554/Streaming/Channels/101"

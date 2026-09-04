@@ -22,6 +22,11 @@ RTSP (1280x720 @25fps)
 三个进程/端口相互独立：`item-ingest --rtsp`（写库）、`item-ingest --preview`
 （8477，实时 MJPEG，不碰库）、`item-web`（8478，只读库）。
 
+`--webcam <n>`（feature `camera`，nokhwa/DirectShow）走**同一条**泵帧-检测-落库
+循环（`main.rs::camera_pump`），只是帧源换成内置/USB 摄像头：无 RTSP 的
+decode-only 概念（每次 `next_frame` 阻塞等相机，帧率 ~2-30fps 由相机决定），
+无 config 时 zone 恒为 `frame`，且不需要 FFmpeg/libclang 那套本机设置。
+
 ## 1. 数据库结构（data/items.db，WAL 模式）
 
 ```sql
