@@ -161,8 +161,10 @@ port can watch (gate with a proxy/Tailscale before exposing beyond the LAN).
   export (opset ≤ 17) at `models/yolov8n.onnx`. Beware hobby exports with
   custom preprocessing nodes (e.g. HzPreprocess) — ort can't run them.
 - Snapshots: the closed loop writes one representative JPEG per NEW
-  observation (`{snapshot-dir}/{id}.jpg`, attached via `set_sample_snapshot`);
-  the Frigate webhook path keeps storing `frigate://` refs instead.
+  observation (`{snapshot-dir}/{id}.jpg`, attached via `set_sample_snapshot`),
+  burned in with that frame's surviving detection boxes (label-colored) and
+  gray dashed zone rects -- pixels only, the DB never stores boxes; the
+  Frigate webhook path keeps storing `frigate://` refs instead.
 - Detection runs at `--detect-fps` (default 1; 720p CPU inference measured
   ~280ms/frame at quality 60) while decode runs at stream rate; a person
   lingering in one zone yields ONE merged observation with a hit count, not
