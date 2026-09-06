@@ -45,6 +45,18 @@ optional = true
 default-features = false
 features = ["codec", "format", "software-scaling"]
 
+# VLM grounding sidecar (OpenAI-compatible multimodal chat/completions over
+# HTTP). Pure Rust, no system deps; blocking client because the Detector trait
+# is sync and the camera loop runs on a plain thread (no tokio context).
+[dependencies.reqwest]
+workspace = true
+optional = true
+features = ["blocking"]
+
+[dependencies.base64]
+workspace = true
+optional = true
+
 [dependencies.tokio-stream]
 version = "0.1"
 features = ["sync"]
@@ -57,3 +69,4 @@ default = []
 yolo = ["dep:ort"]
 camera = ["dep:nokhwa"]
 rtsp = ["dep:ffmpeg-next"]
+vlm = ["dep:reqwest", "dep:base64"]

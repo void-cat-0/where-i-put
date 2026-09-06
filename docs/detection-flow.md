@@ -158,7 +158,8 @@ CREATE TABLE regions (id, camera_id, name, x0, y0, x1, y1, UNIQUE(camera_id,name
 ## 5. 已知的理论↔实际偏差（核对时别当 bug）
 
 - **误分类会入库**：yolov8n 把办公椅认成 `bed` 已实际发生（COCO 类粗）。
-  同类混淆还有 cushion/chair、book/laptop 等。计数照常合并。
+  同类混淆还有 cushion/chair、book/laptop 等。计数照常合并。COCO 之外
+  的物品（keys/remote 等）走 `--detector vlm`（见第 7 节）。
 - **空场也有货**：椅子一直空着坐，chair observation 会一直活着且 hits 猛涨——
   observation 记录的是"物体在场"，不是"物体被使用"。
 - **快照目录与 db 的相对性**：`sample_snapshot` 存的是相对路径，换目录启动
@@ -186,3 +187,26 @@ ls data/snapshots | wc -l
 curl "http://127.0.0.1:8478/api/observations?limit=5"
 curl -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8478/api/observation/1/snapshot
 ```
+
+## 7. VLM grounding 检测器（`--detector vlm`，`--features vlm`）
+
+`--detector vlm` 把第 1 节管线里的 YoloDetector 换成 `VlmGroundDetector`：
+帧 JPEG+base64 后发给 OpenAI 兼容多模态 sidecar（`ITEM_VLM_BASE_URL`/`ITEM_VLM_MODEL`，
+与 4.2 的 ask bar 共用），要求回 JSON 数组 `{"label","bbox_2d":[x1,y1,x2,y2]}`
+（0-1000 归一化；任一坐标 >1000 自动按像素解释）。**管线其余环节零变化**：
+NMS(0.45) → zone_for_point → 5 分钟去重 → 快照烧框高亮，WebUI 照常读。
+区别只在 label 词表：`--targets` 自定义（默认家居 12 类，空串=开放列举），
+不再限 COCO 80 类。
+
+行为差异核对时留意：
+
+- **速度**：一帧一次 HTTP 往返（本地 3B CPU 数秒~十几秒），`--detect-fps`
+  未显式给时自动降到 0.2；检测在途时不读帧，RTSP 可能积压。
+- **sidecar 容错**：请求失败/超时只 warn+跳帧（2s 后再试），**不会**杀
+  camera_pump——YOLO 路径的瞬时推理错误现在也走这条容错路径。
+- **置信度**：VLM 无标定分数，回 `score` 字段就用（clamp 0..1），否则 1.0。
+- **快照语义不变**：每新行一张、高亮本行框；`--detect <img> --out out.png`
+  可在无摄像头时单帧出图（第一个框高亮）。
+
+sidecar 搭建（llama.cpp + Qwen2.5-VL GGUF，走 hf-mirror）：
+[vlm-sidecar.md](vlm-sidecar.md)。

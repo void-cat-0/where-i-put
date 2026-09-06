@@ -14,11 +14,13 @@ Crates, one-way dependencies (`item-ingest`/`item-query`/`item-web` -> `item-cor
   last_seen]", merged while sightings stay within a 5-min dedup window.
 - **crates/item-ingest** — the write side. `FrameSource` (Mock; USB/built-in
   webcams via nokhwa behind `--features camera`; RTSP/IP cameras via
-  ffmpeg-next behind `--features rtsp`) -> `Detector` (Null without features; real
-  YOLOv8-onnx behind `--features yolo` via ort) -> NMS -> zone mapping -> store. Also an
-  axum webhook server that ingests Frigate events directly, skipping local
-  detection entirely, plus an MJPEG web preview bridge for RTSP cameras
-  (`--preview`, feature `rtsp`).
+  ffmpeg-next behind `--features rtsp`) -> `Detector` (Null without features;
+  real YOLOv8-onnx behind `--features yolo` via ort; open-vocabulary VLM
+  grounding behind `--features vlm` — an OpenAI-compatible multimodal sidecar
+  answers with labeled boxes, so keys/remotes beyond COCO-80 work) -> NMS ->
+  zone mapping -> store. Also an axum webhook server that ingests Frigate
+  events directly, skipping local detection entirely, plus an MJPEG web
+  preview bridge for RTSP cameras (`--preview`, feature `rtsp`).
 - **crates/item-query** — the read side. CLI (`log`, `ask`) over observations,
   with an OpenAI-compatible VLM client (llama.cpp/Ollama/cloud sidecar) used
   only when `ITEM_VLM_BASE_URL`/`ITEM_VLM_MODEL` are set. The Rust core never
@@ -48,6 +50,17 @@ cargo run --features rtsp -p item-ingest -- --preview "rtsp://user:pass@192.168.
 
 # object detection on one image (needs a local models/yolov8n.onnx, see below)
 cargo run --features yolo -p item-ingest -- --detect path/to/photo.jpg
+
+# open-vocabulary detection on one image via a VLM sidecar (see
+# docs/vlm-sidecar.md for standing up llama.cpp + Qwen2.5-VL in minutes)
+ITEM_VLM_BASE_URL=http://127.0.0.1:8080/v1 ITEM_VLM_MODEL=qwen2.5-vl-3b-instruct \
+cargo run --features vlm -p item-ingest -- \
+    --detect path/to/photo.jpg --detector vlm --targets "remote,keys" --out out.png
+
+# THE CLOSED LOOP with the VLM detector: camera -> throttled grounding ->
+# zone-mapped observations + snapshots, labels beyond COCO (keys, remote, ...)
+ITEM_VLM_BASE_URL=http://127.0.0.1:8080/v1 ITEM_VLM_MODEL=qwen2.5-vl-3b-instruct \
+cargo run --features "camera,vlm" -p item-ingest -- --webcam 0 --camera-id desk
 
 # THE CLOSED LOOP: camera -> throttled YOLO -> zone-mapped observations + snapshots
 cat > config.toml <<'EOF'
@@ -150,6 +163,34 @@ no JS, no external media server. Routes: `/preview` (page), `/preview.mjpg`
 credentials stay out of logs. LAN-only for now: anyone who can reach the
 port can watch (gate with a proxy/Tailscale before exposing beyond the LAN).
 
+## VLM grounding detector (`--features vlm`)
+
+`--detector vlm` swaps the local YOLO for an open-vocabulary grounding pass
+over an OpenAI-compatible multimodal sidecar (llama.cpp server, Ollama,
+vLLM, cloud): the frame goes out as a base64 JPEG data URL with an
+instruction to return a JSON array of `{"label","bbox_2d"}` (0-1000
+normalized, Qwen-VL convention; replies with any coordinate >1000 are
+auto-read as pixels), and everything downstream — NMS, zone mapping, dedup,
+snapshot burn-in with highlight — is unchanged. Labels are whatever you ask
+for via `--targets` (household defaults: remote, keys, scissors, charger, …;
+empty string = "list everything visible"), reusing
+`ITEM_VLM_BASE_URL`/`ITEM_VLM_MODEL` from the ask bar. Caveats: VLMs give no
+calibrated confidence (a `score` field is used when present, else 1.0), and
+one detection = one HTTP round trip against a local LLM — the loop therefore
+defaults to `--detect-fps 0.2` and skips frames (never dies) while the
+sidecar is down.
+
+Hardware reality: grounding is an LLM round trip per frame — orders of
+magnitude heavier than the YOLO path (~0.3 s/frame on CPU). Measured on a
+Core Ultra 9 285H with a 3B model at Q4: 7-9 s/frame on the Arc 140T iGPU
+(Vulkan build), 14-26 s/frame on 16 CPU threads. **Run the sidecar on
+hardware with real inference headroom (a strong GPU; the Vulkan build also
+drives Intel/AMD iGPUs), or point `ITEM_VLM_BASE_URL`/`ITEM_VLM_MODEL` at
+an external sidecar** — any OpenAI-compatible endpoint on the LAN (vLLM,
+llama.cpp server on another box) or a cloud API works with zero local setup,
+and the ingest machine itself stays model-free. Runbook with download/start
+commands: [docs/vlm-sidecar.md](docs/vlm-sidecar.md).
+
 ## Deliberate choices / non-goals (for now)
 
 - No tracker crate: `norfair` has no maintained Rust port, and fixed-camera
@@ -174,5 +215,5 @@ port can watch (gate with a proxy/Tailscale before exposing beyond the LAN).
 - Detection runs at `--detect-fps` (default 1; 720p CPU inference measured
   ~280ms/frame at quality 60) while decode runs at stream rate; a person
   lingering in one zone yields ONE merged observation with a hit count, not
-  per-frame rows. COCO-only for now: everyday objects like keys need the
-  future VLM-grounding detector (same `Detector` trait, sidecar HTTP).
+  per-frame rows. COCO-only is a YOLO limitation: everyday objects like keys
+  are exactly what the `--detector vlm` grounding backend (above) is for.

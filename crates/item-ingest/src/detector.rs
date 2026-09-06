@@ -114,6 +114,9 @@ impl Detector for NullDetector {
     }
 }
 
+#[cfg(feature = "vlm")]
+pub mod vlm;
+
 #[cfg(feature = "yolo")]
 pub mod yolo {
     //! YOLO via ONNX Runtime (ort 2.0-rc, compile-verified and validated on
