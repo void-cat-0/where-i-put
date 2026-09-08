@@ -191,6 +191,37 @@ llama.cpp server on another box) or a cloud API works with zero local setup,
 and the ingest machine itself stays model-free. Runbook with download/start
 commands: [docs/vlm-sidecar.md](docs/vlm-sidecar.md).
 
+## Roadmap: location inference from occlusion & containment
+
+The flagship target: answer "where are my keys?" even when they are no longer
+visible. Evidence pattern on a single fixed camera: an object disappears from
+detections while a covering/container object appears at its last-seen spot.
+"Occluded by the box" and "inside the box" are indistinguishable to one
+viewpoint and produce the same actionable answer, so one
+disappearance/coverage rule covers both — stated probabilistically ("likely
+in/under the box, now on the shelf"), never as fact. Building blocks, in order:
+
+1. **Resident ingest** (prerequisite, not optional): the disappearance moment
+   and the covering event are temporal facts only continuous observation
+   produces — sporadic manual runs never see them.
+2. **Data model v2**: persist per-observation bboxes (the DB currently stores
+   zone + a burned-in snapshot only, no coordinates) and an events table
+   (appeared / disappeared / covered / moved).
+3. **Query-side rule engine** (item-query): match disappearances to coverage
+   events; transitive tracking through containers (once contained, the
+   container's position IS the item's position — box moves, the answer
+   follows); optional open-lid verification by asking the VLM "is X in the
+   box?" when it is visible.
+4. **WebUI evidence cards**: last-seen snapshot -> covering-event snapshot ->
+   inference with explicit confidence.
+
+Identity stays cheap: position-continuity + label association for large
+static containers, manual naming in the WebUI over automatic re-ID (no
+appearance-embedding trackers). Known hard edges: keys are not in COCO-80
+(use `--detector vlm --targets`), small-object VLM grounding is the weak
+spot, and transient occluders (people) vs persistent ones must be told apart
+— validate the chain with detectable stand-in objects first.
+
 ## Deliberate choices / non-goals (for now)
 
 - No tracker crate: `norfair` has no maintained Rust port, and fixed-camera
