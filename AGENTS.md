@@ -28,6 +28,12 @@ Common commands an agent will need:
 | Abandon a change | `jj abandon -r <change>` |
 | Diff a change | `jj diff --change <change>` / `obslog` for history |
 
+Commands that open an interactive editor hang agent bash sessions on this
+Windows box (no usable `$EDITOR`): `jj describe` without `--stdin`,
+`jj split` even with `--message`. Always describe via
+`jj describe --stdin <<'MSG' ... MSG`; treat any jj subcommand that might
+spawn an editor as forbidden in non-interactive runs.
+
 jj concepts differ from git: every snapshot of the working copy **is** a
 commit (change); there is no index/staging area. `jj describe` replaces
 "commit with message". A change left without a description is normal
@@ -70,3 +76,18 @@ Before ending a work session, make sure `@` has a meaningful description
   persistence — never store raw per-frame detections in SQLite.
 - New optional native backends go behind cargo features, default off, so a
   fresh clone builds and tests green with zero system dependencies.
+
+## Local-only agent notes: `AGENT-MEMORIES/`
+
+Machine-specific agent memory lives in `AGENT-MEMORIES/` (git-ignored):
+LAN camera credentials (`camera-access.md`), CN-network workarounds,
+tooling quirks, and a volatile session-state snapshot. Read it before
+working on this repo, and write new machine-specific facts there rather
+than into any single tool's private memory. The split:
+
+- Durable + project-scoped → this file, `README.md`, or `docs/` (tracked).
+- Machine/environment-specific or secret → `AGENT-MEMORIES/` (ignored).
+
+Never commit that folder, never "clean it up", and never copy its contents
+(credentials) into tracked files. In piped shell commands, use
+`set -o pipefail` — `head`/`tail` in a pipeline swallow upstream exit codes.
