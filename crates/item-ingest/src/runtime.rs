@@ -33,6 +33,17 @@ pub enum SourceSpec {
 }
 
 impl SourceSpec {
+    /// The cargo feature that makes this source usable (`""` when it always
+    /// works). Deliberately distinct from [`SourceSpec::kind`], which is the
+    /// log name: the feature is `camera`, the kind is `webcam`.
+    pub fn cargo_feature(&self) -> &'static str {
+        match self {
+            SourceSpec::Mock { .. } => "",
+            SourceSpec::Rtsp { .. } => "rtsp",
+            SourceSpec::Webcam { .. } => "camera",
+        }
+    }
+
     /// `rtsp` / `webcam` / `mock` -- used in log lines and health output.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -106,6 +117,18 @@ impl CameraTask {
     /// the loop -- the historical loop used the same 0.05 floor.
     pub fn detect_interval(&self) -> Duration {
         Duration::from_secs_f64(1.0 / self.detect_fps.max(0.05))
+    }
+}
+
+/// Can *this build* open that kind of source at all?
+///
+/// `false` is a configuration error, not a transient one: the daemon refuses to
+/// start rather than retrying forever against a missing cargo feature.
+pub fn source_supported(spec: &SourceSpec) -> bool {
+    match spec {
+        SourceSpec::Mock { .. } => true,
+        SourceSpec::Rtsp { .. } => cfg!(feature = "rtsp"),
+        SourceSpec::Webcam { .. } => cfg!(feature = "camera"),
     }
 }
 

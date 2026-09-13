@@ -44,6 +44,10 @@ struct Args {
     /// startup on every mode. See item_ingest::config.
     #[arg(long)]
     config: Option<String>,
+    /// Run as a resident daemon: webhook + preview + every enabled camera in
+    /// --config, until a stop signal. Requires --config.
+    #[arg(long)]
+    daemon: bool,
 
     /// Address for the Frigate webhook server (default: 127.0.0.1:8477).
     #[arg(long)]
@@ -194,6 +198,19 @@ fn main() -> anyhow::Result<()> {
         "resolved runtime settings"
     );
 
+    // Resident mode owns the store, so it has to run before anything here opens
+    // the database: the single-instance lock is taken first (§1).
+    if args.daemon {
+        let file = file_config
+            .as_ref()
+            .context("--daemon requires --config <file>")?;
+        let mut settings = settings;
+        // Relative paths resolve against the config file's directory, not the
+        // cwd a service manager happens to pick (§3).
+        settings.absolutize(&config_dir(&args));
+        return item_ingest::daemon::run(settings, file);
+    }
+
     if let Some(dir) = Path::new(&settings.db).parent() {
         std::fs::create_dir_all(dir).ok();
     }
@@ -257,6 +274,19 @@ fn main() -> anyhow::Result<()> {
         axum::serve(listener, app).await?;
         anyhow::Ok(())
     })
+}
+
+/// The directory that relative paths in config.toml resolve against: the
+/// config file's own directory, or the cwd when there is no config file.
+fn config_dir(args: &Args) -> std::path::PathBuf {
+    args.config
+        .as_deref()
+        .map(Path::new)
+        .and_then(Path::parent)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 /// The CLI layer of the merge: only the values the user actually passed.

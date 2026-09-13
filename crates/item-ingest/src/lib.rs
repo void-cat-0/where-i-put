@@ -9,8 +9,11 @@
 
 pub mod annotate;
 pub mod config;
+pub mod daemon;
 pub mod detector;
 pub mod frigate;
+pub mod health;
+pub mod lock;
 #[cfg(feature = "rtsp")]
 pub mod preview;
 pub mod runner;

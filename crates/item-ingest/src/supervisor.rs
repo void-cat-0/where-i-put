@@ -7,12 +7,12 @@
 //! genuinely fatal condition (e.g. a model that cannot be loaded) marks that
 //! camera `failed` and stops retrying instead of spamming the log.
 //!
-//! Scope note (P0): the backoff is the historical fixed 2s. Exponential backoff
-//! with a 60s ceiling is P2 and the event checkpoints that hook into the same
-//! `step()` boundary are P4 (docs/resident-ingest.md §10). The store lock is
-//! taken coarsely, once per `step()`; moving annotation + JPEG encoding out of
-//! it (§3) needs `ingest_detections` to take the shared handle, which lands
-//! with the daemon in P1.
+//! Scope note (P1): the backoff is still the historical fixed 2s -- exponential
+//! backoff with a 60s ceiling is P2, and the event checkpoints that hook into
+//! the same `step()` boundary are P4 (docs/resident-ingest.md §10). The store
+//! lock is taken coarsely, once per `step()`; moving annotation + JPEG encoding
+//! out of it (§3) needs `ingest_detections` to take the shared handle, which is
+//! still open work.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +20,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::SharedStore;
+use crate::health::HealthRegistry;
 use crate::runner::{CameraRunner, StepOutcome};
 use crate::runtime::{self, CameraTask};
 use crate::source::SourceError;
@@ -61,11 +62,28 @@ impl CameraOutcome {
 /// Owns the camera threads and the graceful-stop flag.
 pub struct Supervisor {
     stop: Arc<AtomicBool>,
+    handles: Vec<JoinHandle<CameraOutcome>>,
+    /// Outcomes that never got a thread (spawn failure), kept so `join` reports
+    /// them alongside the real ones.
+    failures: Vec<CameraOutcome>,
+    health: Option<HealthRegistry>,
 }
 
 impl Supervisor {
     pub fn new(stop: Arc<AtomicBool>) -> Self {
-        Self { stop }
+        Self {
+            stop,
+            handles: Vec::new(),
+            failures: Vec::new(),
+            health: None,
+        }
+    }
+
+    /// Publish each camera's health into `registry` as it runs. The daemon
+    /// installs one so `health.json` has something to say.
+    pub fn with_health(mut self, registry: HealthRegistry) -> Self {
+        self.health = Some(registry);
+        self
     }
 
     pub fn stop_flag(&self) -> Arc<AtomicBool> {
@@ -76,15 +94,12 @@ impl Supervisor {
         self.stop.store(true, Ordering::SeqCst);
     }
 
-    /// Run every enabled camera that has a local source, one thread each, and
-    /// join them all before returning.
+    /// Spawn one thread per enabled camera that has a local source. Returns
+    /// immediately; use [`Supervisor::join`] to wait.
     ///
     /// Webhook-fed cameras (`source == None`) get no thread: their frames come
     /// from the HTTP path, and trying to "open" them would spin forever.
-    pub fn run(&self, store: &SharedStore, tasks: Vec<CameraTask>) -> Vec<CameraOutcome> {
-        let mut outcomes = Vec::new();
-        let mut handles: Vec<JoinHandle<CameraOutcome>> = Vec::new();
-
+    pub fn start(&mut self, store: &SharedStore, tasks: Vec<CameraTask>) {
         for task in tasks
             .into_iter()
             .filter(|t| t.enabled && t.source.is_some())
@@ -92,41 +107,79 @@ impl Supervisor {
             let camera_id = task.camera_id.clone();
             let store = Arc::clone(store);
             let stop = Arc::clone(&self.stop);
+            let health = self.health.clone();
             match thread::Builder::new()
                 .name(format!("camera-{camera_id}"))
-                .spawn(move || drive(store, task, stop))
+                .spawn(move || drive(store, task, stop, health))
             {
-                Ok(handle) => handles.push(handle),
+                Ok(handle) => self.handles.push(handle),
                 Err(e) => {
                     let mut outcome = CameraOutcome::for_camera(camera_id);
                     outcome.error = Some(format!("could not spawn camera thread: {e}"));
-                    outcomes.push(outcome);
+                    self.failures.push(outcome);
                 }
             }
         }
+    }
 
-        // A panicking camera must not take the others down with it.
-        for handle in handles {
-            match handle.join() {
-                Ok(outcome) => outcomes.push(outcome),
-                Err(_) => tracing::error!("camera thread panicked; continuing with the rest"),
+    /// Wait for every camera thread, at most `timeout`. A camera still running
+    /// when the deadline passes is abandoned with a warning -- the daemon has a
+    /// shutdown budget (§3) and must not hang on a wedged decoder.
+    pub fn join(mut self, timeout: Option<Duration>) -> Vec<CameraOutcome> {
+        let deadline = timeout.map(|t| Instant::now() + t);
+        let mut outcomes = std::mem::take(&mut self.failures);
+        let total = self.handles.len();
+
+        for (index, handle) in std::mem::take(&mut self.handles).into_iter().enumerate() {
+            loop {
+                if handle.is_finished() {
+                    match handle.join() {
+                        Ok(outcome) => outcomes.push(outcome),
+                        Err(_) => {
+                            tracing::error!("camera thread panicked; continuing with the rest")
+                        }
+                    }
+                    break;
+                }
+                if let Some(deadline) = deadline
+                    && Instant::now() >= deadline
+                {
+                    tracing::warn!(
+                        abandoned = total - index,
+                        "camera threads did not stop in time; abandoning them"
+                    );
+                    return outcomes;
+                }
+                thread::sleep(STOP_POLL);
             }
         }
         outcomes
+    }
+
+    /// `start` + `join` with no timeout: the single-camera CLI paths.
+    pub fn run(mut self, store: &SharedStore, tasks: Vec<CameraTask>) -> Vec<CameraOutcome> {
+        self.start(store, tasks);
+        self.join(None)
     }
 }
 
 /// Convenience for the single-camera CLI paths.
 pub fn run_one(store: &SharedStore, task: CameraTask) -> CameraOutcome {
+    let camera_id = task.camera_id.clone();
     let supervisor = Supervisor::new(Arc::new(AtomicBool::new(false)));
     supervisor
         .run(store, vec![task])
         .pop()
-        .unwrap_or_else(|| CameraOutcome::for_camera("unknown"))
+        .unwrap_or_else(|| CameraOutcome::for_camera(camera_id))
 }
 
 /// The whole life of one camera, on its own thread.
-fn drive(store: SharedStore, task: CameraTask, stop: Arc<AtomicBool>) -> CameraOutcome {
+fn drive(
+    store: SharedStore,
+    task: CameraTask,
+    stop: Arc<AtomicBool>,
+    health: Option<HealthRegistry>,
+) -> CameraOutcome {
     let mut outcome = CameraOutcome::for_camera(task.camera_id.clone());
 
     // Fatal on purpose: a missing model file or a missing cargo feature will not
@@ -149,6 +202,15 @@ fn drive(store: SharedStore, task: CameraTask, stop: Arc<AtomicBool>) -> CameraO
         .unwrap_or_default();
 
     let mut runner = CameraRunner::new(task, detector);
+    let camera_id = runner.task().camera_id.clone();
+
+    macro_rules! publish {
+        () => {
+            if let Some(registry) = health.as_ref() {
+                registry.publish(&camera_id, runner.health());
+            }
+        };
+    }
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -160,6 +222,7 @@ fn drive(store: SharedStore, task: CameraTask, stop: Arc<AtomicBool>) -> CameraO
             tracing::info!(source = %source_desc, "opening {kind} source");
             if let Err(e) = runner.open() {
                 tracing::warn!(error = %e, "connect failed, retrying in 2s");
+                publish!();
                 if sleep_backoff(&stop) {
                     runner.mark_stopped();
                     break;
@@ -172,6 +235,7 @@ fn drive(store: SharedStore, task: CameraTask, stop: Arc<AtomicBool>) -> CameraO
             let store = store.lock().expect("store mutex poisoned");
             runner.step(&store)
         };
+        publish!();
 
         match stepped {
             Ok(StepOutcome::Finished) => {
@@ -201,7 +265,7 @@ fn drive(store: SharedStore, task: CameraTask, stop: Arc<AtomicBool>) -> CameraO
                 // Store/IO errors are not self-healing: stop this camera and
                 // let the service manager or the user deal with it.
                 let reason = format!("{e:#}");
-                tracing::error!(camera = %runner.task().camera_id, error = %reason, "camera step failed; stopping this camera");
+                tracing::error!(camera = %camera_id, error = %reason, "camera step failed; stopping this camera");
                 runner.mark_failed(&reason);
                 outcome.error = Some(reason);
                 break;
@@ -209,11 +273,14 @@ fn drive(store: SharedStore, task: CameraTask, stop: Arc<AtomicBool>) -> CameraO
         }
     }
 
-    let health = runner.health();
-    outcome.frames = health.frames;
-    outcome.detections = health.detections;
-    outcome.recorded = health.recorded;
-    outcome.reconnects = health.reconnects;
+    let final_health = runner.health();
+    outcome.frames = final_health.frames;
+    outcome.detections = final_health.detections;
+    outcome.recorded = final_health.recorded;
+    outcome.reconnects = final_health.reconnects;
+    if let Some(registry) = health.as_ref() {
+        registry.publish(&camera_id, final_health);
+    }
     outcome
 }
 
@@ -233,6 +300,7 @@ fn sleep_backoff(stop: &AtomicBool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::CameraState;
     use crate::runtime::{DetectorSpec, SourceSpec};
     use item_core::store::Store;
     use std::sync::Mutex;
@@ -257,6 +325,10 @@ mod tests {
         Arc::new(Mutex::new(Store::in_memory().unwrap()))
     }
 
+    fn idle() -> Supervisor {
+        Supervisor::new(Arc::new(AtomicBool::new(false)))
+    }
+
     #[test]
     fn a_mock_camera_runs_to_its_frame_budget() {
         let store = store();
@@ -275,8 +347,7 @@ mod tests {
         let store = store();
         let mut webhook_task = mock_task("fed-by-frigate", 1, 1);
         webhook_task.source = None;
-        let supervisor = Supervisor::new(Arc::new(AtomicBool::new(false)));
-        let outcomes = supervisor.run(&store, vec![webhook_task]);
+        let outcomes = idle().run(&store, vec![webhook_task]);
         assert!(
             outcomes.is_empty(),
             "a camera with no local source must not be driven: {outcomes:?}"
@@ -300,8 +371,26 @@ mod tests {
         let store = store();
         let mut task = mock_task("off", 10, 1);
         task.enabled = false;
-        let supervisor = Supervisor::new(Arc::new(AtomicBool::new(false)));
-        assert!(supervisor.run(&store, vec![task]).is_empty());
+        assert!(idle().run(&store, vec![task]).is_empty());
+    }
+
+    #[test]
+    fn a_running_camera_publishes_health_while_it_works() {
+        let store = store();
+        let registry = HealthRegistry::new();
+        let supervisor = idle().with_health(registry.clone());
+        let outcomes = supervisor.run(&store, vec![mock_task("cam", 10, 2)]);
+
+        assert_eq!(outcomes[0].frames, 2);
+        let published = registry.get("cam").expect("health published");
+        assert_eq!(published.frames, 2);
+        assert_eq!(published.state, CameraState::Stopped);
+    }
+
+    #[test]
+    fn an_empty_supervisor_joins_immediately() {
+        let store = store();
+        assert!(idle().run(&store, Vec::new()).is_empty());
     }
 
     #[cfg(feature = "yolo")]

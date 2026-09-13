@@ -42,9 +42,12 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
+
+use crate::runtime::{CameraTask, DetectorSpec, SourceSpec};
 
 /// Built-in defaults: the lowest-precedence layer of the merge.
 pub mod defaults {
@@ -149,6 +152,32 @@ impl Config {
             }
         }
         Ok(n)
+    }
+
+    /// One task per camera the daemon should drive: the enabled `[[camera]]`
+    /// rows, in file order.
+    ///
+    /// A row without a `url` is webhook-fed, so it gets `source: None` -- the
+    /// supervisor reads that as "no thread", which is the honest answer.
+    pub fn camera_tasks(&self, settings: &RuntimeConfig) -> Vec<CameraTask> {
+        self.camera
+            .iter()
+            .filter(|cam| cam.enabled.unwrap_or(true))
+            .map(|cam| CameraTask {
+                camera_id: cam.id.clone(),
+                source: cam.url.as_deref().filter(|url| !url.is_empty()).map(|url| {
+                    SourceSpec::Rtsp {
+                        url: url.to_string(),
+                    }
+                }),
+                detector: settings.detector_spec_for(Some(cam)),
+                detect_fps: settings.detect_fps_for(Some(cam)),
+                snapshot_dir: PathBuf::from(&settings.snapshots_dir),
+                // The daemon runs until it is asked to stop.
+                max_frames: 0,
+                enabled: true,
+            })
+            .collect()
     }
 }
 
@@ -298,12 +327,104 @@ impl RuntimeConfig {
     /// else. This is the historical `effective_detect_fps` rule, moved into the
     /// resolved config so it can be unit-tested.
     pub fn detect_fps(&self) -> f64 {
-        self.detect_fps.unwrap_or(if self.detector == "vlm" {
-            defaults::DETECT_FPS_VLM
-        } else {
-            defaults::DETECT_FPS_LOCAL
-        })
+        self.detect_fps_for(None)
     }
+
+    /// The same rule, but a `[[camera]]` row may override both the detector
+    /// and the rate -- so a row that says `vlm` gets the VLM default even when
+    /// the global default is `yolo`.
+    pub fn detect_fps_for(&self, row: Option<&CameraConfig>) -> f64 {
+        let name = row
+            .and_then(|c| c.detector.as_deref())
+            .unwrap_or(self.detector.as_str());
+        row.and_then(|c| c.detect_fps)
+            .or(self.detect_fps)
+            .unwrap_or(if name == "vlm" {
+                defaults::DETECT_FPS_VLM
+            } else {
+                defaults::DETECT_FPS_LOCAL
+            })
+    }
+
+    /// The detector spec for one camera. A `[[camera]]` row may override the
+    /// resolved `detector` and `targets`; the model path and the VLM endpoint
+    /// come from the merged settings.
+    pub fn detector_spec_for(&self, row: Option<&CameraConfig>) -> DetectorSpec {
+        let name = row
+            .and_then(|c| c.detector.as_deref())
+            .unwrap_or(self.detector.as_str());
+        let targets = row
+            .and_then(|c| c.targets.as_deref())
+            .unwrap_or(self.targets.as_str());
+
+        match name {
+            "vlm" => DetectorSpec::Vlm {
+                base_url: self.vlm_base_url.clone().unwrap_or_default(),
+                model: self.vlm_model.clone().unwrap_or_default(),
+                targets: Self::vlm_targets(targets),
+                timeout: Duration::from_secs(self.vlm_timeout),
+                coords: self.vlm_coords.clone(),
+            },
+            _ => DetectorSpec::Yolo {
+                model: PathBuf::from(&self.model),
+                labels: crate::detector::COCO_LABELS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                input_size: self.input_size,
+                conf: self.conf,
+            },
+        }
+    }
+
+    #[cfg(feature = "vlm")]
+    fn vlm_targets(spec: &str) -> Vec<String> {
+        crate::detector::vlm::parse_targets(spec)
+    }
+
+    /// No VLM backend in this build: the vocabulary is inert, and
+    /// `runtime::build_detector` is where the missing feature gets reported.
+    #[cfg(not(feature = "vlm"))]
+    fn vlm_targets(_spec: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Make every path absolute, resolving relative paths against the **config
+    /// file's directory** rather than the process cwd (docs/resident-ingest.md
+    /// §3). A service manager picks the cwd, so a daemon that trusted it would
+    /// write snapshots where `item-web` cannot find them.
+    pub fn absolutize(&mut self, base: &Path) {
+        self.db = absolute(base, &self.db);
+        self.snapshots_dir = absolute(base, &self.snapshots_dir);
+        self.health_file = absolute(base, &self.health_file);
+    }
+
+    /// The single-instance lock lives next to the database: one writer per
+    /// database, whatever the daemon happens to be called (§1).
+    pub fn lock_path(&self) -> PathBuf {
+        match Path::new(&self.db).parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join("ingest.lock"),
+            _ => PathBuf::from("ingest.lock"),
+        }
+    }
+}
+
+/// Absolute form of `path`, resolved against `base` when it is relative.
+///
+/// Lexical only (`std::path::absolute`): the target usually does not exist yet,
+/// so `canonicalize` would fail, and resolving symlinks is not what callers
+/// want here anyway.
+fn absolute(base: &Path, path: &str) -> String {
+    let path = Path::new(path);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    std::path::absolute(&joined)
+        .unwrap_or(joined)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// CLI value, else file value, else the built-in default.

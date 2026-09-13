@@ -51,6 +51,19 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// Fold the WAL back into the main database file. Called on daemon
+    /// shutdown so a stopped process leaves one compact file
+    /// (docs/resident-ingest.md §3/§7). `wal_checkpoint` returns a row, so
+    /// `execute_batch` cannot be used here.
+    pub fn checkpoint(&self) -> Result<()> {
+        let _: (i64, i64, i64) =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+        Ok(())
+    }
+
     fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS regions (

@@ -1,9 +1,9 @@
 # 常驻 ingest 设计草案（resident ingest）
 
-> 状态：**已定案，P0 已完成**（2026-09-13）。§11 的决策已拍板；P0 的两半都已落地：
-> 结构拆分（`CameraTask` / `CameraRunner` / `Supervisor`，见 `item-ingest/src/runtime.rs`、
-> `runner.rs`、`supervisor.rs`）与 `Args → RuntimeConfig` 四层合并（见 `item-ingest/src/config.rs`，
-> 逐层单测）。P1–P5 未实现。
+> 状态：**已定案，P0 + P1 落地**（2026-09-13）。§11 的决策已拍板；P0 的两半
+> （结构拆分、`Args → RuntimeConfig` 四层合并）与 P1（`--daemon` 常驻骨架：单实例锁、
+> 健康快照、路径绝对化、优雅停机）都已实现，见 §4 的两条落地注记（含尚未验证的缺口）。
+> P2–P5 未实现。
 > 上位依据：`README.md` 的 Roadmap 第 1 条把常驻化写成"前置条件，不是可选项"
 > ——消失时刻与覆盖事件是只有连续观测才能产生的时间事实；`AGENT-MEMORIES/`
 > 的进度快照记「下一步开发 = 常驻化」。
@@ -184,14 +184,31 @@ CLI 形态的变化（保持旧用法可用）：
 
 **P0 落地注记（2026-09-13）**：上面这套合并已实现于 `item-ingest/src/config.rs` ——
 `CliOverrides`（只记用户真正给过的值，所以 `Args` 里可被覆盖的项一律是 `Option<T>`）、
-`EnvOverrides`、`RuntimeConfig::resolve`，八个单测逐层锁住优先级。两点与本文原文有出入，
+`EnvOverrides`、`RuntimeConfig::resolve`，九个单测逐层锁住优先级。一点与本文原文有出入，
 按代码为准：
 
 - **`camera_id` 不来自 config.toml**：它是旧命令行为帧归属的身份，让配置去改它会在
   同一条命令行下把 observation 写到别的相机上。`[[camera]]` 行只在 id 已确定后用来取
   该相机的 `detector` / `detect_fps` / `targets`。
-- **`--daemon` 入口尚未实现**（属 P1）；`[[camera]]` 的 `url` 字段仍未被消费 ——
-  P0 只让配置能覆盖单相机 CLI 的参数，daemon 才按 camera 行构造任务。
+
+**P1 落地注记（2026-09-13）**：`item-ingest --daemon --config <file>` 已实现，落在三个新
+模块 —— `daemon.rs`（编排与停机顺序）、`lock.rs`（单实例锁）、`health.rs`（健康快照与
+注册表）；`supervisor.rs` 拆出 `start` / `join(timeout)` 以支持 10s 停机预算；
+`[[camera]]` 的 `url` 现在被消费（每行一个 `CameraTask`），`enabled = false` 的行跳过。
+
+与本文的差异，以及**尚未验证的部分**：
+
+- **单实例锁放在数据库旁边**（`<db 目录>/ingest.lock`），不单独配置；默认库在 `data/`
+  下，所以结果仍是 §1 写的 `data/ingest.lock`。
+- **`--maintenance` 尚不存在**（§7，属 P3），因此还没有"离线子命令跳过锁"的入口。
+- **健康文件还不是原子写**：目前直接 `std::fs::write`，写失败只 warn；`.tmp` + rename
+  加重试是 P2 的事。
+- **Windows 上「控制台事件 → 优雅停机」这条链没有端到端验证过**：代码走
+  `tokio::signal::ctrl_c()`，但实测只做到「硬杀 → 留下过期锁文件并报出持锁 pid」。
+  `Ctrl-Break` 需要裸的 `SetConsoleCtrlHandler`，tokio 没有封装，**未处理**；
+  Unix 侧的 `SIGHUP` 也**未处理**（走默认终止）。
+- **相机线程仍在粗粒度锁下跑**：`step()` 整体持 `Arc<Mutex<Store>>`，标注 + JPEG 编码
+  因此落在锁内，与 §3 的不变量不符。多相机下这是真实争用点，仍待修。
 
 ## 5. 外部可观测：健康快照文件
 
