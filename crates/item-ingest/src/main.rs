@@ -11,28 +11,47 @@ use anyhow::Context;
 use clap::Parser;
 
 use item_core::store::Store;
+use item_ingest::config::CliOverrides;
+#[cfg(any(
+    feature = "yolo",
+    feature = "vlm",
+    feature = "rtsp",
+    feature = "camera"
+))]
+use item_ingest::config::RuntimeConfig;
 use item_ingest::detector::{Detector, NullDetector};
+#[cfg(any(
+    feature = "yolo",
+    feature = "vlm",
+    feature = "rtsp",
+    feature = "camera"
+))]
+use item_ingest::runtime::DetectorSpec;
+#[cfg(any(feature = "rtsp", feature = "camera"))]
+use item_ingest::runtime::{CameraTask, SourceSpec};
 use item_ingest::source::{FrameSource, MockSource, SourceError};
+#[cfg(any(feature = "rtsp", feature = "camera"))]
+use item_ingest::{SharedStore, supervisor};
 
 #[derive(Parser)]
 #[command(name = "item-ingest")]
 struct Args {
-    /// SQLite database path.
-    #[arg(long, default_value = "data/items.db")]
-    db: String,
+    /// SQLite database path (default: data/items.db).
+    #[arg(long)]
+    db: Option<String>,
 
     /// Camera/region config (TOML); regions are seeded into the store at
     /// startup on every mode. See item_ingest::config.
     #[arg(long)]
     config: Option<String>,
 
-    /// Address for the Frigate webhook server.
-    #[arg(long, default_value = "127.0.0.1:8477")]
-    listen: String,
+    /// Address for the Frigate webhook server (default: 127.0.0.1:8477).
+    #[arg(long)]
+    listen: Option<String>,
 
-    /// Directory for observation snapshot JPEGs.
-    #[arg(long, default_value = "data/snapshots")]
-    snapshots_dir: String,
+    /// Directory for observation snapshot JPEGs (default: data/snapshots).
+    #[arg(long)]
+    snapshots_dir: Option<String>,
 
     /// Run a mock camera pass (blank frames through the pipeline) and exit.
     #[arg(long)]
@@ -44,10 +63,10 @@ struct Args {
     #[arg(long)]
     rtsp: Option<String>,
 
-    /// Camera id to attribute --rtsp/--webcam frames to.
+    /// Camera id to attribute --rtsp/--webcam frames to (default: rtsp-0).
     #[cfg(any(feature = "rtsp", feature = "camera"))]
-    #[arg(long, default_value = "rtsp-0")]
-    camera_id: String,
+    #[arg(long)]
+    camera_id: Option<String>,
 
     /// Max frames to ingest from --rtsp/--webcam before exiting
     /// (0 = run forever; RTSP also stops at stream EOF).
@@ -78,10 +97,10 @@ struct Args {
 
     /// Which detection backend to run: `yolo` (local onnx, requires
     /// `--features yolo`) or `vlm` (open-vocabulary grounding via an
-    /// OpenAI-compatible sidecar, requires `--features vlm`).
+    /// OpenAI-compatible sidecar, requires `--features vlm`). Default: yolo.
     #[cfg(any(feature = "yolo", feature = "vlm"))]
-    #[arg(long, default_value = "yolo")]
-    detector: String,
+    #[arg(long)]
+    detector: Option<String>,
 
     /// Run the selected detector on one JPEG/PNG image and exit
     /// (requires `--features yolo` or `vlm`). Prints detections + timing.
@@ -96,20 +115,20 @@ struct Args {
     #[arg(long)]
     out: Option<String>,
 
-    /// Model path for detection (yolov8n/yolo11n export, dynamic or 640 input).
+    /// Model path for YOLO detection (default: models/yolov8n.onnx).
     #[cfg(feature = "yolo")]
-    #[arg(long, default_value = "models/yolov8n.onnx")]
-    model: String,
+    #[arg(long)]
+    model: Option<String>,
 
-    /// Input tensor size the ONNX graph was exported at.
+    /// Input tensor size the ONNX graph was exported at (default: 640).
     #[cfg(feature = "yolo")]
-    #[arg(long, default_value_t = 640)]
-    input_size: usize,
+    #[arg(long)]
+    input_size: Option<usize>,
 
-    /// Confidence floor for detection (both --detect and the camera loop).
+    /// Confidence floor, both --detect and the camera loop (default: 0.3).
     #[cfg(feature = "yolo")]
-    #[arg(long, default_value_t = 0.3)]
-    conf: f32,
+    #[arg(long)]
+    conf: Option<f32>,
 
     /// Base URL of the OpenAI-compatible VLM sidecar, including the /v1
     /// prefix (e.g. http://127.0.0.1:8080/v1). Falls back to
@@ -123,24 +142,24 @@ struct Args {
     #[arg(long)]
     vlm_model: Option<String>,
 
-    /// Per-request timeout for the VLM sidecar (a local LLM grounding one
-    /// frame can take tens of seconds).
+    /// Per-request timeout for the VLM sidecar, in seconds (default: 60) --
+    /// a local LLM grounding one frame can take tens of seconds.
     #[cfg(feature = "vlm")]
-    #[arg(long, default_value_t = 60)]
-    vlm_timeout: u64,
+    #[arg(long)]
+    vlm_timeout: Option<u64>,
 
     /// Coordinate convention to ask of the sidecar: norm1000 (Qwen-VL
-    /// convention) or pixel. Replies with any coordinate > 1000 are always
-    /// interpreted as pixels.
+    /// convention) or pixel (default: norm1000). Any coordinate > 1000 in a
+    /// reply is always interpreted as pixels.
     #[cfg(feature = "vlm")]
-    #[arg(long, default_value = "norm1000")]
-    vlm_coords: String,
+    #[arg(long)]
+    vlm_coords: Option<String>,
 
     /// Comma-separated object vocabulary to ground; empty = open-ended
-    /// "list everything visible" mode.
+    /// "list everything visible" mode (default: the built-in vocabulary).
     #[cfg(feature = "vlm")]
-    #[arg(long, default_value = item_ingest::detector::vlm::DEFAULT_TARGETS)]
-    targets: String,
+    #[arg(long)]
+    targets: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -154,16 +173,36 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    if let Some(dir) = Path::new(&args.db).parent() {
+
+    // Four-layer merge: built-in defaults -> config.toml -> environment -> CLI.
+    let file_config = match args.config.as_deref() {
+        Some(path) => Some(item_ingest::config::Config::load(Path::new(path))?),
+        None => None,
+    };
+    let settings = item_ingest::config::RuntimeConfig::resolve(
+        file_config.as_ref(),
+        &cli_overrides(&args),
+        &item_ingest::config::EnvOverrides::from_env(),
+    );
+    // Log the resolved shape, never the values that carry credentials.
+    tracing::debug!(
+        db = %settings.db,
+        listen = %settings.listen,
+        camera_id = %settings.camera_id,
+        detector = %settings.detector,
+        detect_fps = settings.detect_fps(),
+        "resolved runtime settings"
+    );
+
+    if let Some(dir) = Path::new(&settings.db).parent() {
         std::fs::create_dir_all(dir).ok();
     }
-    let store = Store::open(&args.db).context("opening sqlite store")?;
+    let store = Store::open(&settings.db).context("opening sqlite store")?;
 
-    if let Some(path) = args.config.as_deref() {
-        let cfg = item_ingest::config::Config::load(Path::new(path))?;
-        let n = cfg.seed_regions(&store)?;
+    if let Some(file) = file_config.as_ref() {
+        let n = file.seed_regions(&store)?;
         tracing::info!(
-            cameras = cfg.camera.len(),
+            cameras = file.camera.len(),
             regions = n,
             "config regions seeded"
         );
@@ -175,17 +214,17 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(any(feature = "yolo", feature = "vlm"))]
     if let Some(img) = args.detect.as_deref() {
-        return detect_pass(&args, img);
+        return detect_pass(&settings, img, args.out.as_deref());
     }
 
     #[cfg(feature = "rtsp")]
     if let Some(url) = args.rtsp.as_deref() {
-        return rtsp_pass(&store, &args, url);
+        return rtsp_pass(store, &settings, url, args.frames);
     }
 
     #[cfg(feature = "camera")]
     if let Some(index) = args.webcam {
-        return webcam_pass(&store, &args, index);
+        return webcam_pass(store, &settings, index, args.frames);
     }
 
     let state: item_ingest::frigate::State = Arc::new(Mutex::new(store));
@@ -193,11 +232,11 @@ fn main() -> anyhow::Result<()> {
 
     // Shadow (not mut): with `rtsp` off there is nothing to merge.
     #[cfg(feature = "rtsp")]
-    let app = match args.preview.clone() {
+    let app = match settings.preview_url.clone() {
         Some(url) => {
             // Credentials are part of the url; log only scheme+host.
             tracing::info!(
-                target_url = redact_url(&url),
+                target_url = item_ingest::runtime::redact_url(&url),
                 "web preview enabled at GET /preview"
             );
             app.merge(item_ingest::preview::router(
@@ -207,7 +246,7 @@ fn main() -> anyhow::Result<()> {
         None => app,
     };
 
-    let addr: SocketAddr = args.listen.parse().context("bad --listen")?;
+    let addr: SocketAddr = settings.listen.parse().context("bad --listen")?;
     tracing::info!(%addr, "frigate webhook server listening");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -220,85 +259,101 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
-/// The detector for the camera loop and --detect, per `--detector`:
-/// `yolo` (local onnx; default) or `vlm` (open-vocabulary grounding via the
-/// OpenAI-compatible sidecar). A missing 'yolo' feature falls back to
-/// NullDetector so the pipeline still exercises; a missing 'vlm' feature
-/// hard-errors -- a silently null VLM would be indistinguishable from a
-/// broken sidecar.
-#[cfg(any(feature = "yolo", feature = "vlm"))]
-fn build_detector(args: &Args) -> anyhow::Result<Box<dyn Detector>> {
-    match args.detector.as_str() {
-        "yolo" => {
-            #[cfg(feature = "yolo")]
-            let det: Box<dyn Detector> = {
-                use item_ingest::detector::COCO_LABELS;
-                use item_ingest::detector::yolo::YoloDetector;
-
-                let det = YoloDetector::new(
-                    Path::new(&args.model),
-                    COCO_LABELS.iter().map(|s| s.to_string()).collect(),
-                    args.input_size,
-                    args.conf,
-                )
-                .map_err(|e| anyhow::anyhow!("model load: {e}"))?;
-                tracing::info!(model = %args.model, conf = args.conf, "yolo detector enabled");
-                Box::new(det)
-            };
-            #[cfg(not(feature = "yolo"))]
-            let det: Box<dyn Detector> = {
-                tracing::warn!(
-                    "--detector yolo but built without 'yolo' feature: camera loop runs \
-                     NullDetector (no observations); rebuild with --features yolo"
-                );
-                Box::new(NullDetector)
-            };
-            Ok(det)
-        }
-        "vlm" => {
-            #[cfg(feature = "vlm")]
-            let det: Box<dyn Detector> = {
-                use item_ingest::detector::vlm::{CoordMode, VlmGroundDetector, parse_targets};
-
-                let base = args
-                    .vlm_base_url
-                    .clone()
-                    .or_else(|| std::env::var("ITEM_VLM_BASE_URL").ok())
-                    .unwrap_or_default();
-                let model = args
-                    .vlm_model
-                    .clone()
-                    .or_else(|| std::env::var("ITEM_VLM_MODEL").ok())
-                    .unwrap_or_default();
-                let coords: CoordMode = args
-                    .vlm_coords
-                    .parse()
-                    .map_err(|e: String| anyhow::anyhow!("{e}"))?;
-                let targets = parse_targets(&args.targets);
-                let det = VlmGroundDetector::new(
-                    &base,
-                    &model,
-                    targets.clone(),
-                    std::time::Duration::from_secs(args.vlm_timeout),
-                    coords,
-                )?;
-                tracing::info!(
-                    base = %base,
-                    model = %model,
-                    ?targets,
-                    timeout_s = args.vlm_timeout,
-                    "vlm grounding detector enabled"
-                );
-                Box::new(det)
-            };
-            #[cfg(not(feature = "vlm"))]
-            let det: Box<dyn Detector> = anyhow::bail!(
-                "--detector vlm requires the 'vlm' feature: rebuild with --features vlm"
-            );
-            Ok(det)
-        }
-        other => anyhow::bail!("unknown --detector '{other}' (yolo|vlm)"),
+/// The CLI layer of the merge: only the values the user actually passed.
+/// `None` means "not given", which is what lets config.toml beat a default.
+fn cli_overrides(args: &Args) -> CliOverrides {
+    #[allow(unused_mut)]
+    let mut o = CliOverrides {
+        db: args.db.clone(),
+        snapshots_dir: args.snapshots_dir.clone(),
+        listen: args.listen.clone(),
+        ..Default::default()
+    };
+    #[cfg(any(feature = "rtsp", feature = "camera"))]
+    {
+        o.camera_id = args.camera_id.clone();
+        o.detect_fps = args.detect_fps;
     }
+    #[cfg(any(feature = "yolo", feature = "vlm"))]
+    {
+        o.detector = args.detector.clone();
+    }
+    #[cfg(feature = "yolo")]
+    {
+        o.model = args.model.clone();
+        o.input_size = args.input_size;
+        o.conf = args.conf;
+    }
+    #[cfg(feature = "vlm")]
+    {
+        o.vlm_base_url = args.vlm_base_url.clone();
+        o.vlm_model = args.vlm_model.clone();
+        o.vlm_timeout = args.vlm_timeout;
+        o.vlm_coords = args.vlm_coords.clone();
+        o.targets = args.targets.clone();
+    }
+    #[cfg(feature = "rtsp")]
+    {
+        o.preview_url = args.preview.clone();
+    }
+    o
+}
+
+/// The detector this invocation asks for, as data: `yolo` (local onnx;
+/// default) or `vlm` (open-vocabulary grounding via the OpenAI-compatible
+/// sidecar). Turning the spec into a live detector is `runtime`'s job, so a
+/// missing 'yolo' feature degrades to NullDetector while a missing 'vlm'
+/// feature hard-errors -- a silently null VLM would be indistinguishable from
+/// a broken sidecar.
+#[cfg(any(feature = "yolo", feature = "vlm"))]
+fn detector_spec(settings: &RuntimeConfig) -> anyhow::Result<DetectorSpec> {
+    Ok(match settings.detector.as_str() {
+        "yolo" => yolo_spec(settings),
+        "vlm" => vlm_spec(settings)?,
+        other => anyhow::bail!("unknown --detector '{other}' (yolo|vlm)"),
+    })
+}
+
+#[cfg(feature = "vlm")]
+fn vlm_spec(settings: &RuntimeConfig) -> anyhow::Result<DetectorSpec> {
+    Ok(DetectorSpec::Vlm {
+        base_url: settings.vlm_base_url.clone().unwrap_or_default(),
+        model: settings.vlm_model.clone().unwrap_or_default(),
+        targets: item_ingest::detector::vlm::parse_targets(&settings.targets),
+        timeout: std::time::Duration::from_secs(settings.vlm_timeout),
+        coords: settings.vlm_coords.clone(),
+    })
+}
+
+/// `--detector vlm` with the feature off: a hard error, because a silently
+/// null VLM would be indistinguishable from a broken sidecar.
+#[cfg(all(any(feature = "yolo", feature = "vlm"), not(feature = "vlm")))]
+fn vlm_spec(_settings: &RuntimeConfig) -> anyhow::Result<DetectorSpec> {
+    anyhow::bail!("detector 'vlm' requires the 'vlm' feature: rebuild with --features vlm")
+}
+
+#[cfg(feature = "yolo")]
+fn yolo_spec(settings: &RuntimeConfig) -> DetectorSpec {
+    DetectorSpec::Yolo {
+        model: Path::new(&settings.model).to_path_buf(),
+        labels: item_ingest::detector::COCO_LABELS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        input_size: settings.input_size,
+        conf: settings.conf,
+    }
+}
+
+/// `--detector yolo` with the feature off: say so once, then run a null
+/// detector so the plumbing still exercises (no observations).
+#[cfg(all(any(feature = "yolo", feature = "vlm"), not(feature = "yolo")))]
+fn yolo_spec(_settings: &RuntimeConfig) -> DetectorSpec {
+    tracing::warn!(
+        "--detector yolo but built without 'yolo' feature: camera loop runs \
+         NullDetector (no observations); rebuild with --features yolo"
+    );
+    DetectorSpec::Null
 }
 
 /// No detector features at all: the camera loop still exercises the plumbing.
@@ -306,12 +361,12 @@ fn build_detector(args: &Args) -> anyhow::Result<Box<dyn Detector>> {
     not(any(feature = "yolo", feature = "vlm")),
     any(feature = "rtsp", feature = "camera")
 ))]
-fn build_detector(_args: &Args) -> anyhow::Result<Box<dyn Detector>> {
+fn detector_spec(_settings: &RuntimeConfig) -> anyhow::Result<DetectorSpec> {
     tracing::warn!(
         "built without 'yolo'/'vlm' features: camera loop runs NullDetector \
          (no observations); rebuild with --features yolo or --features vlm"
     );
-    Ok(Box::new(NullDetector))
+    Ok(DetectorSpec::Null)
 }
 
 /// End-to-end smoke of the local pipeline without hardware or Frigate:
@@ -347,25 +402,12 @@ fn demo_pass(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Strip credentials from an RTSP url for safe logging
-/// (rtsp://user:pass@host/path -> rtsp://host/path).
-#[cfg(feature = "rtsp")]
-fn redact_url(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => match rest.rsplit_once('@') {
-            Some((_, host_path)) => format!("{scheme}://{host_path}"),
-            None => url.to_string(),
-        },
-        None => url.to_string(),
-    }
-}
-
 /// Run the selected detector on a single image file (--detect):
 /// decode -> detect -> NMS report with timing. `--out` saves an annotated
 /// copy (all boxes with label chips; the first one highlighted thick with
 /// its white ring, like a freshly born observation snapshot).
 #[cfg(any(feature = "yolo", feature = "vlm"))]
-fn detect_pass(args: &Args, img_path: &str) -> anyhow::Result<()> {
+fn detect_pass(settings: &RuntimeConfig, img_path: &str, out: Option<&str>) -> anyhow::Result<()> {
     use std::time::Instant;
 
     let img = image::open(img_path)
@@ -373,7 +415,7 @@ fn detect_pass(args: &Args, img_path: &str) -> anyhow::Result<()> {
         .to_rgb8();
     let (w, h) = img.dimensions();
     let started = Instant::now();
-    let det = build_detector(args)?;
+    let det = item_ingest::runtime::build_detector(&detector_spec(settings)?)?;
     let load_ms = started.elapsed();
     let raw = det
         .detect(img.as_raw(), w, h)
@@ -401,7 +443,7 @@ fn detect_pass(args: &Args, img_path: &str) -> anyhow::Result<()> {
             d.bbox[3]
         );
     }
-    if let Some(out) = args.out.as_deref() {
+    if let Some(out) = out {
         let refs: Vec<&item_core::Detection> = kept.iter().collect();
         let highlight = (!refs.is_empty()).then_some(0);
         match item_ingest::annotate::annotate(img.as_raw(), w, h, &refs, &[], highlight) {
@@ -417,144 +459,69 @@ fn detect_pass(args: &Args, img_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Detection rate for the camera loop: explicit --detect-fps wins; otherwise
-/// 0.2 for the VLM sidecar (one HTTP round trip per detection against a local
-/// LLM is slow) and 1.0 for everything else.
+/// Shared tail for the single-camera CLI paths (`--rtsp` / `--webcam`).
+///
+/// Each one builds a [`CameraTask`] and hands it to the [`supervisor`], so the
+/// loop, the frame budget and the retry policy live in one place. `--frames N`
+/// still reports the same summary line it always did.
 #[cfg(any(feature = "rtsp", feature = "camera"))]
-fn effective_detect_fps(args: &Args) -> f64 {
-    match args.detect_fps {
-        Some(fps) => fps,
-        None => {
-            #[cfg(any(feature = "yolo", feature = "vlm"))]
-            let vlm = args.detector == "vlm";
-            #[cfg(not(any(feature = "yolo", feature = "vlm")))]
-            let vlm = false;
-            if vlm { 0.2 } else { 1.0 }
-        }
+fn run_single_camera(store: Store, task: CameraTask) {
+    let kind = task.source.as_ref().map(|s| s.kind()).unwrap_or("camera");
+    let camera_id = task.camera_id.clone();
+    let shared: SharedStore = Arc::new(Mutex::new(store));
+    let outcome = supervisor::run_one(&shared, task);
+    if outcome.finished {
+        println!(
+            "ingested {} {kind} frames ({} detections) from {camera_id}",
+            outcome.frames, outcome.detections
+        );
     }
 }
 
-/// The shared camera loop behind --rtsp/--webcam: frames are pulled at the
-/// source's rate (and cheaply dropped), detection runs at --detect-fps,
-/// surviving hits become zone-mapped observations whose first sighting gets
-/// an annotated snapshot JPEG. On EOF/source error, restarts the source
-/// forever after 2s -- like preview does. Detector errors (e.g. the VLM
-/// sidecar being down) only skip the frame, they do not kill the loop.
-///
-/// Threading: `make_source` and every `next_frame` call happen on THIS
-/// thread, which nokhwa's COM-affine camera requires (see source::nokhwa).
+/// The camera task described by the resolved settings plus a local source.
 #[cfg(any(feature = "rtsp", feature = "camera"))]
-fn camera_pump(
-    store: &Store,
-    args: &Args,
-    detector: &dyn Detector,
-    kind: &str,
-    source_desc: &str,
-    make_source: &mut dyn FnMut() -> anyhow::Result<Box<dyn FrameSource>>,
-) -> anyhow::Result<()> {
-    use std::time::{Duration, Instant};
-
-    let snaps = Path::new(&args.snapshots_dir);
-    let interval = Duration::from_secs_f64(1.0 / effective_detect_fps(args).max(0.05));
-    let mut last_detect = Instant::now() - interval;
-    let mut frames = 0u64;
-    let mut detected = 0u64;
-    loop {
-        tracing::info!(source = %source_desc, "opening {kind} source");
-        let mut source = match make_source() {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "connect failed, retrying in 2s");
-                std::thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-        };
-        loop {
-            if args.frames > 0 && frames >= args.frames {
-                println!(
-                    "ingested {frames} {kind} frames ({detected} detections) from {}",
-                    args.camera_id
-                );
-                return Ok(());
-            }
-            let frame = match source.next_frame() {
-                Ok(f) => f,
-                Err(SourceError::Eof) => {
-                    tracing::info!("stream ended, reconnecting");
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "source error, reconnecting");
-                    break;
-                }
-            };
-            frames += 1;
-            if last_detect.elapsed() < interval {
-                continue; // decode-only frame, throttle detection
-            }
-            last_detect = Instant::now();
-            let dets = match detector.detect(&frame.rgb, frame.meta.width, frame.meta.height) {
-                Ok(d) => d,
-                Err(e) => {
-                    // A downed VLM sidecar (or a transient ort error) must not
-                    // kill the loop; drop this frame and back off.
-                    tracing::warn!(error = %e, "detector failed, skipping frame");
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue;
-                }
-            };
-            detected += 1;
-            let recorded = item_ingest::ingest_detections(
-                store,
-                &frame.meta,
-                &dets,
-                0.45,
-                0.0, // detector already floors at conf
-                Some((&frame.rgb, snaps)),
-            )?;
-            if recorded > 0 {
-                tracing::info!(frames, recorded, "detections ingested");
-            }
-        }
-        std::thread::sleep(Duration::from_secs(2));
-    }
+fn camera_task(
+    settings: &RuntimeConfig,
+    source: SourceSpec,
+    max_frames: u64,
+) -> anyhow::Result<CameraTask> {
+    Ok(CameraTask {
+        camera_id: settings.camera_id.clone(),
+        source: Some(source),
+        detector: detector_spec(settings)?,
+        detect_fps: settings.detect_fps(),
+        snapshot_dir: Path::new(&settings.snapshots_dir).to_path_buf(),
+        max_frames,
+        enabled: true,
+    })
 }
 
 /// Closed loop over an RTSP stream (reconnecting forever).
 #[cfg(feature = "rtsp")]
-fn rtsp_pass(store: &Store, args: &Args, url: &str) -> anyhow::Result<()> {
-    use item_ingest::source::rtsp::RtspSource;
-
-    let detector = build_detector(args)?;
-    let mut open = || -> anyhow::Result<Box<dyn FrameSource>> {
-        Ok(Box::new(RtspSource::new(&args.camera_id, url)?))
+fn rtsp_pass(
+    store: Store,
+    settings: &RuntimeConfig,
+    url: &str,
+    max_frames: u64,
+) -> anyhow::Result<()> {
+    let source = SourceSpec::Rtsp {
+        url: url.to_string(),
     };
-    camera_pump(
-        store,
-        args,
-        detector.as_ref(),
-        "rtsp",
-        &redact_url(url),
-        &mut open,
-    )
+    let task = camera_task(settings, source, max_frames)?;
+    run_single_camera(store, task);
+    Ok(())
 }
 
 /// Closed loop over a local webcam (nokhwa; no FFmpeg needed). A dead or
 /// busy camera surfaces as a source error, so the loop keeps retrying.
 #[cfg(feature = "camera")]
-fn webcam_pass(store: &Store, args: &Args, index: u32) -> anyhow::Result<()> {
-    use item_ingest::source::nokhwa::NokhwaSource;
-
-    let detector = build_detector(args)?;
-    let mut open = || -> anyhow::Result<Box<dyn FrameSource>> {
-        Ok(Box::new(NokhwaSource::new(args.camera_id.clone(), index)))
-    };
-    camera_pump(
-        store,
-        args,
-        detector.as_ref(),
-        "webcam",
-        &format!("#{index}"),
-        &mut open,
-    )
+fn webcam_pass(
+    store: Store,
+    settings: &RuntimeConfig,
+    index: u32,
+    max_frames: u64,
+) -> anyhow::Result<()> {
+    let task = camera_task(settings, SourceSpec::Webcam { index }, max_frames)?;
+    run_single_camera(store, task);
+    Ok(())
 }

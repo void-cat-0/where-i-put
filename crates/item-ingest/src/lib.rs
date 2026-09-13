@@ -13,7 +13,10 @@ pub mod detector;
 pub mod frigate;
 #[cfg(feature = "rtsp")]
 pub mod preview;
+pub mod runner;
+pub mod runtime;
 pub mod source;
+pub mod supervisor;
 
 use chrono::Utc;
 use std::io::Write;
