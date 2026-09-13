@@ -5,6 +5,14 @@
 Vision-based item memory: watch cameras (or a Frigate NVR's events), remember
 where objects were last seen, answer "where are my keys?".
 
+**Cross-platform by design**: Windows, Linux and macOS are all first-class
+targets — not a port to be attempted later. Platform-specific behaviour
+(services, signals, atomic file replacement) must be stated explicitly rather
+than silently defaulting to one OS; `#[cfg(...)]` is reserved for genuinely
+platform-specific code (signal kinds, locking primitives). The only
+deliberately single-platform pieces today are the RTSP toolchain fallbacks
+(no BtbN prebuilt for macOS, which uses a system/brew FFmpeg instead).
+
 Crates, one-way dependencies (`item-ingest`/`item-query`/`item-web` -> `item-core`;
 `item-web` also reuses `item-query`'s prompt+VLM client):
 
@@ -203,7 +211,9 @@ in/under the box, now on the shelf"), never as fact. Building blocks, in order:
 
 1. **Resident ingest** (prerequisite, not optional): the disappearance moment
    and the covering event are temporal facts only continuous observation
-   produces — sporadic manual runs never see them.
+   produces — sporadic manual runs never see them. Design draft (process model,
+   config, health file, retention, event observation):
+   [docs/resident-ingest.md](docs/resident-ingest.md).
 2. **Data model v2**: persist per-observation bboxes (the DB currently stores
    zone + a burned-in snapshot only, no coordinates) and an events table
    (appeared / disappeared / covered / moved).

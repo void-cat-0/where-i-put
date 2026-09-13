@@ -105,7 +105,8 @@ CREATE TABLE regions (id, camera_id, name, x0, y0, x1, y1, UNIQUE(camera_id,name
 `--detect-fps 1` 时 hits 增速约为其一半。）
 
 - **停止循环后**：行不再更新但也不删除——last_seen 从此就是"最后一次见到"。
-
+  （这正是常驻化的理由："停止"在常驻模式下不再是常态，见
+  [resident-ingest.md](resident-ingest.md)。）
 ## 4. Web UI 对照（8478 端口）
 
 ### 4.1 一张卡片 = 一行 observation

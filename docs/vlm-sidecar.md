@@ -128,7 +128,8 @@ cargo run --features "rtsp,vlm" -p item-ingest -- \
   0..1），没有就记 1.0。NMS 去重不受影响。
 - **检测期间不读帧**：camera_pump 是同步循环，grounding 请求在途时帧不消费；
   RTSP 缓冲可能积压。本地 3B CPU 一帧数秒~十几秒，先把 `--detect-fps` 当
-  0.2 用；要实时性等常驻化/异步化改造。
+  0.2 用；要实时性等常驻化/异步化改造——常驻化设计见
+  [resident-ingest.md](resident-ingest.md)（该文明确：本阶段不修此问题）。
 - **sidecar 挂了 ≠ 循环挂**：detector 报错只 warn + 跳帧（隔 2s 再试），
   这是相对 YOLO 路径新增的容错。
 - **3B grounding 质量有限**：框位置偶尔漂、label 口语化（"tv remote" vs
