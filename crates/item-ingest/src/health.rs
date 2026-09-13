@@ -5,13 +5,18 @@
 //! decides liveness is `updated_at` -- `pid` is advisory, because Windows would
 //! need `OpenProcess`, Unix pids get reused, and neither is a portable std API.
 //!
-//! P1 writes the file plainly. The atomic `.tmp` + rename dance with a Windows
-//! retry (a reader holding the file open makes `rename` fail there) is P2, per
-//! §10.
+//! Writes are atomic: serialize into `<path>.tmp`, then rename over the target,
+//! so a reader never sees half a file. On Windows a reader holding the target
+//! open makes that rename fail with a sharing violation (Unix does not care), so
+//! the rename is retried and, as a last resort, the target is deleted first --
+//! the contract in §5 is that the file may be briefly missing or stale, and
+//! every reader must tolerate that.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Serialize;
@@ -137,8 +142,58 @@ impl HealthWriter {
             std::fs::create_dir_all(dir)?;
         }
         let json = serde_json::to_string_pretty(&snapshot).map_err(std::io::Error::other)?;
-        std::fs::write(&self.path, json)
+        write_atomic(&self.path, json.as_bytes())
     }
+
+    /// The cameras this file describes; the daemon's heartbeat log walks them.
+    pub fn cameras(&self) -> &[CameraMeta] {
+        &self.cameras
+    }
+}
+
+/// How many times a failing `rename` is retried before the fallback.
+const RENAME_ATTEMPTS: u32 = 3;
+
+/// Base delay between those retries; the nth retry waits `n * this`.
+const RENAME_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Replace `path` with `bytes`, atomically where the platform allows it.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = tmp_path(path);
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        // Not fatal if the OS declines to flush: the rename is what matters.
+        let _ = file.sync_all();
+    }
+
+    let mut last_error = None;
+    for attempt in 1..=RENAME_ATTEMPTS {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_error = Some(e);
+                std::thread::sleep(RENAME_BACKOFF * attempt);
+            }
+        }
+    }
+
+    // A reader that refuses to share DELETE (the Windows case) still yields to
+    // a delete: the file is briefly absent, which readers must already tolerate.
+    if std::fs::remove_file(path).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        return Ok(());
+    }
+
+    let _ = std::fs::remove_file(&tmp);
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("rename failed")))
+}
+
+/// `health.json` -> `health.json.tmp`, in the same directory so the rename
+/// stays on one filesystem.
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
 }
 
 fn camera_entry(
@@ -267,6 +322,83 @@ mod tests {
         assert_eq!(value["pid"], std::process::id());
         assert_eq!(value["cameras"][0]["frames"], 7);
         assert_eq!(value["detector_default"], "yolo");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_leaves_no_temp_file_behind() {
+        let dir = std::env::temp_dir().join(format!("item-ingest-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("health.json");
+        let registry = HealthRegistry::new();
+        let mut writer = HealthWriter::new(
+            &path,
+            "yolo",
+            vec![CameraMeta {
+                id: "cam".into(),
+                source: "mock".into(),
+            }],
+        );
+
+        writer.write(&registry).unwrap();
+        writer.write(&registry).unwrap();
+
+        assert!(
+            !dir.join("health.json.tmp").exists(),
+            "the temp file is renamed away, never left behind"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["seq"], 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §5's contract: a reader may hold the file, and the write must still land.
+    /// On Windows a reader that refuses to share DELETE makes `rename` fail, so
+    /// `write_atomic` retries and then falls back to delete + rename.
+    #[test]
+    fn a_reader_holding_the_file_does_not_block_the_write() {
+        let dir = std::env::temp_dir().join(format!("item-ingest-reader-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("health.json");
+        let registry = HealthRegistry::new();
+        let mut writer = HealthWriter::new(
+            &path,
+            "yolo",
+            vec![CameraMeta {
+                id: "cam".into(),
+                source: "mock".into(),
+            }],
+        );
+        writer.write(&registry).unwrap();
+
+        let held = std::fs::File::open(&path).expect("a reader can hold the file");
+        writer.write(&registry).unwrap();
+        drop(held);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["seq"], 2);
+        assert!(!dir.join("health.json.tmp").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The failure path: a target that cannot be replaced (here a directory)
+    /// must be reported, and the temp file must not be left lying around.
+    #[test]
+    fn an_impossible_rename_is_reported_and_cleans_up() {
+        let dir =
+            std::env::temp_dir().join(format!("item-ingest-badrename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = dir.join("health.json");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let err = write_atomic(&target, b"{}").unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert!(!tmp_path(&target).exists(), "the temp file is cleaned up");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

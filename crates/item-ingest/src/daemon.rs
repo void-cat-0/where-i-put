@@ -37,6 +37,13 @@ pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
 /// How often the health file is refreshed (§5).
 pub const HEALTH_INTERVAL: Duration = Duration::from_secs(15);
 
+/// How often a one-line "still alive" summary is logged (§5). Silence must
+/// never be indistinguishable from success.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Resolution of the health/heartbeat timers.
+const TICK: Duration = Duration::from_millis(200);
+
 /// Run the daemon until a stop signal arrives. Wires the stop flag to the
 /// process signals; this is the entry point `--daemon` uses.
 pub fn run(settings: RuntimeConfig, file: &Config) -> anyhow::Result<()> {
@@ -92,20 +99,21 @@ pub fn run_with_stop(
     }
 
     let registry = HealthRegistry::new();
+    let camera_metas: Vec<CameraMeta> = tasks
+        .iter()
+        .map(|task| CameraMeta {
+            id: task.camera_id.clone(),
+            source: task
+                .source
+                .as_ref()
+                .map(|s| s.describe())
+                .unwrap_or_else(|| "webhook".to_string()),
+        })
+        .collect();
     let writer = Arc::new(Mutex::new(HealthWriter::new(
         &settings.health_file,
         &settings.detector,
-        tasks
-            .iter()
-            .map(|task| CameraMeta {
-                id: task.camera_id.clone(),
-                source: task
-                    .source
-                    .as_ref()
-                    .map(|s| s.describe())
-                    .unwrap_or_else(|| "webhook".to_string()),
-            })
-            .collect(),
+        camera_metas.clone(),
     )));
     write_health(&writer, &registry);
 
@@ -122,16 +130,23 @@ pub fn run_with_stop(
         std::thread::Builder::new()
             .name("health".to_string())
             .spawn(move || {
+                let mut until_write = HEALTH_INTERVAL;
+                let mut until_heartbeat = HEARTBEAT_INTERVAL;
                 while !stop.load(Ordering::SeqCst) {
-                    let mut waited = Duration::ZERO;
-                    while waited < HEALTH_INTERVAL {
-                        if stop.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(200));
-                        waited += Duration::from_millis(200);
+                    std::thread::sleep(TICK);
+                    if stop.load(Ordering::SeqCst) {
+                        return;
                     }
-                    write_health(&writer, &registry);
+                    until_write = until_write.saturating_sub(TICK);
+                    until_heartbeat = until_heartbeat.saturating_sub(TICK);
+                    if until_write.is_zero() {
+                        write_health(&writer, &registry);
+                        until_write = HEALTH_INTERVAL;
+                    }
+                    if until_heartbeat.is_zero() {
+                        log_heartbeat(&registry, &camera_metas);
+                        until_heartbeat = HEARTBEAT_INTERVAL;
+                    }
                 }
             })
             .context("spawning the health writer thread")?
@@ -243,6 +258,26 @@ fn build_router(store: &SharedStore, settings: &RuntimeConfig) -> axum::Router {
     let _ = settings;
 
     app
+}
+
+/// One "still alive" line per camera (§5). Without it, "ran six hours and
+/// recorded nothing" and "working normally" look identical in the log.
+fn log_heartbeat(registry: &HealthRegistry, cameras: &[CameraMeta]) {
+    for meta in cameras {
+        match registry.get(&meta.id) {
+            Some(h) => tracing::info!(
+                camera = %meta.id,
+                state = h.state.as_str(),
+                frames = h.frames,
+                detections = h.detections,
+                recorded = h.recorded,
+                reconnects = h.reconnects,
+                last_frame_age_s = ?h.last_frame_age.map(|age| age.as_secs()),
+                "heartbeat"
+            ),
+            None => tracing::info!(camera = %meta.id, "heartbeat: no report yet"),
+        }
+    }
 }
 
 fn write_health(writer: &Mutex<HealthWriter>, registry: &HealthRegistry) {

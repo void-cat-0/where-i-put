@@ -25,8 +25,48 @@ use crate::runner::{CameraRunner, StepOutcome};
 use crate::runtime::{self, CameraTask};
 use crate::source::SourceError;
 
-/// Fixed wait before reopening a source or after a detector failure.
-pub const BACKOFF: Duration = Duration::from_secs(2);
+/// Reconnect backoff: doubles from the historical fixed 2s up to a 60s
+/// ceiling, so an unplugged camera costs a handful of log lines per hour
+/// instead of one every two seconds (docs/resident-ingest.md §10, P2).
+#[derive(Debug, Clone)]
+pub struct Backoff {
+    current: Duration,
+}
+
+impl Backoff {
+    /// Where the historical fixed delay used to sit.
+    pub const INITIAL: Duration = Duration::from_secs(2);
+    /// The worst case: one attempt a minute per broken camera.
+    pub const MAX: Duration = Duration::from_secs(60);
+
+    pub fn new() -> Self {
+        Self {
+            current: Self::INITIAL,
+        }
+    }
+
+    /// The delay to apply now, then double it for the next attempt.
+    pub fn next(&mut self) -> Duration {
+        let wait = self.current;
+        self.current = (self.current * 2).min(Self::MAX);
+        wait
+    }
+
+    /// A source came back: the next outage starts from the base delay again.
+    pub fn reset(&mut self) {
+        self.current = Self::INITIAL;
+    }
+
+    pub fn current(&self) -> Duration {
+        self.current
+    }
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// How often the backoff sleep re-checks the stop flag.
 const STOP_POLL: Duration = Duration::from_millis(50);
@@ -212,6 +252,9 @@ fn drive(
         };
     }
 
+    // Reconnect delays double up to the ceiling (§10 P2).
+    let mut backoff = Backoff::new();
+
     loop {
         if stop.load(Ordering::SeqCst) {
             runner.mark_stopped();
@@ -221,9 +264,10 @@ fn drive(
         if !runner.is_open() {
             tracing::info!(source = %source_desc, "opening {kind} source");
             if let Err(e) = runner.open() {
-                tracing::warn!(error = %e, "connect failed, retrying in 2s");
+                let delay = backoff.next();
+                tracing::warn!(error = %e, retry_in_s = delay.as_secs(), "connect failed");
                 publish!();
-                if sleep_backoff(&stop) {
+                if sleep_backoff(&stop, delay) {
                     runner.mark_stopped();
                     break;
                 }
@@ -243,24 +287,40 @@ fn drive(
                 break;
             }
             Ok(StepOutcome::Lost(reason)) => {
+                let delay = backoff.next();
                 match &reason {
-                    Some(SourceError::Eof) => tracing::info!("stream ended, reconnecting"),
-                    Some(e) => tracing::warn!(error = %e, "source error, reconnecting"),
-                    None => tracing::warn!("no source open, reconnecting"),
+                    Some(SourceError::Eof) => {
+                        tracing::info!(retry_in_s = delay.as_secs(), "stream ended, reconnecting")
+                    }
+                    Some(e) => tracing::warn!(
+                        error = %e,
+                        retry_in_s = delay.as_secs(),
+                        "source error, reconnecting"
+                    ),
+                    None => {
+                        tracing::warn!(retry_in_s = delay.as_secs(), "no source open, reconnecting")
+                    }
                 }
-                if sleep_backoff(&stop) {
+                if sleep_backoff(&stop, delay) {
                     runner.mark_stopped();
                     break;
                 }
             }
             Ok(StepOutcome::DetectorFailed) => {
-                // The runner already warned; just back off before retrying.
-                if sleep_backoff(&stop) {
+                // The runner already warned about the detector itself; this is
+                // only the pause before trying the next frame.
+                let delay = backoff.next();
+                tracing::warn!(
+                    retry_in_s = delay.as_secs(),
+                    "detector unavailable; backing off before the next frame"
+                );
+                if sleep_backoff(&stop, delay) {
                     runner.mark_stopped();
                     break;
                 }
             }
-            Ok(StepOutcome::Detected { .. }) | Ok(StepOutcome::Throttled) => {}
+            // A real frame arrived: the next outage starts from the base delay.
+            Ok(StepOutcome::Detected { .. }) | Ok(StepOutcome::Throttled) => backoff.reset(),
             Err(e) => {
                 // Store/IO errors are not self-healing: stop this camera and
                 // let the service manager or the user deal with it.
@@ -284,15 +344,16 @@ fn drive(
     outcome
 }
 
-/// Sleep [`BACKOFF`], returning early (and reporting `true`) when a stop is
-/// requested. A plain `thread::sleep` here would make Ctrl-C wait up to 2s.
-fn sleep_backoff(stop: &AtomicBool) -> bool {
-    let deadline = Instant::now() + BACKOFF;
+/// Sleep `delay`, returning early (and reporting `true`) when a stop is
+/// requested. A plain `thread::sleep` would make Ctrl-C wait out the whole
+/// backoff, which at the 60s ceiling would be unacceptable.
+fn sleep_backoff(stop: &AtomicBool, delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
     while Instant::now() < deadline {
         if stop.load(Ordering::SeqCst) {
             return true;
         }
-        thread::sleep(STOP_POLL);
+        thread::sleep(STOP_POLL.min(delay));
     }
     stop.load(Ordering::SeqCst)
 }
@@ -408,5 +469,20 @@ mod tests {
         let error = outcome.error.expect("missing model must be reported");
         assert!(error.contains("model load"), "unexpected error: {error}");
         assert_eq!(outcome.frames, 0, "never pulled a frame");
+    }
+    #[test]
+    fn backoff_doubles_to_the_ceiling_and_resets() {
+        let mut backoff = Backoff::new();
+        assert_eq!(backoff.next(), Duration::from_secs(2));
+        assert_eq!(backoff.next(), Duration::from_secs(4));
+        assert_eq!(backoff.next(), Duration::from_secs(8));
+        assert_eq!(backoff.next(), Duration::from_secs(16));
+        assert_eq!(backoff.next(), Duration::from_secs(32));
+        assert_eq!(backoff.next(), Duration::from_secs(60), "capped");
+        assert_eq!(backoff.next(), Duration::from_secs(60), "stays capped");
+
+        // A camera that comes back must not inherit the old penalty.
+        backoff.reset();
+        assert_eq!(backoff.next(), Duration::from_secs(2));
     }
 }
