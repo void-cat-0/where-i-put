@@ -229,6 +229,18 @@ fn drive(
         Err(e) => {
             let reason = format!("{e:#}");
             tracing::error!(camera = %task.camera_id, error = %reason, "camera failed to start; not retrying");
+            // §5 wants `failed` to be visible: a camera that never got as far as
+            // running must not look like one that is merely still starting.
+            if let Some(registry) = health.as_ref() {
+                registry.publish(
+                    &task.camera_id,
+                    crate::runner::CameraHealth {
+                        state: crate::runner::CameraState::Failed,
+                        last_error: Some(reason.clone()),
+                        ..Default::default()
+                    },
+                );
+            }
             outcome.error = Some(reason);
             return outcome;
         }
@@ -273,6 +285,10 @@ fn drive(
                 }
                 continue;
             }
+            // The source is up: publish `running` now, so a camera that is
+            // connected but has not produced a frame yet does not read as
+            // "starting" in health.json.
+            publish!();
         }
 
         let stepped = {

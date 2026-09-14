@@ -1,9 +1,10 @@
 # 常驻 ingest 设计草案（resident ingest）
 
-> 状态：**已定案，P0 + P1 + P2 落地**（2026-09-13）。§11 的决策已拍板；P0 的两半
-> （结构拆分、`Args → RuntimeConfig` 四层合并）、P1（`--daemon` 常驻骨架：单实例锁、
-> 健康快照、路径绝对化、优雅停机）与 P2（健康文件原子写 + 心跳日志 + 指数退避）都已
-> 实现，见 §4 的三条落地注记（含尚未验证的缺口）。P3–P5 未实现。
+> 状态：**已定案，P0 + P1 + P2 落地，并已实机验证**（2026-09-13 / 09-14）。§11 的决策
+> 已拍板；P0 的两半（结构拆分、`Args → RuntimeConfig` 四层合并）、P1（`--daemon` 常驻
+> 骨架：单实例锁、健康快照、路径绝对化、优雅停机）与 P2（健康文件原子写 + 心跳日志 +
+> 指数退避）都已实现，见 §4 的三条落地注记与实机验证记录（含尚未验证的缺口）。
+> P3–P5 未实现。
 > 上位依据：`README.md` 的 Roadmap 第 1 条把常驻化写成"前置条件，不是可选项"
 > ——消失时刻与覆盖事件是只有连续观测才能产生的时间事实；`AGENT-MEMORIES/`
 > 的进度快照记「下一步开发 = 常驻化」。
@@ -221,6 +222,36 @@ CLI 形态的变化（保持旧用法可用）：
 - **指数退避**：2s 起、每次翻倍、上限 60s（`Backoff`）；**只有真帧到达才重置**，所以
   拔线的相机一小时只花掉个位数日志行。重连、建连失败、detector 失败共用同一条退避。
 - 退避的等待是可被打断的（50ms 粒度检查 stop），所以 60s 上限不会拖慢停机。
+
+**实机验证记录（2026-09-14）**：在这台 Windows 机器上用真实设备把三条链路各跑了一遍
+（网络环境变化，局域网海康摄像头当时不可达，所以 RTSP 走本地回环）：
+
+- **内置摄像头 + 真 YOLO（单相机 CLI）**：`--webcam 0 --detector yolo`，120 帧；真实检出
+  person / chair / refrigerator / cup；4 张标注快照落盘；`item-web` 指向同一个库，
+  `/api/observations` 读回这些 observation，`/api/observation/{id}/snapshot` 返回
+  200 `image/jpeg`（278095 字节）。**P1 那条「快照能被 item-web 显示」的验收，这是第一次
+  用真数据成立。**
+- **内置摄像头 + daemon（`[[camera]] webcam = 0`）**：health.json 从 `starting` 走到
+  `running`，frames / detections / recorded 递增到 22 / 22 / 82，推理 EWMA 522ms，
+  `last_frame_age_s = 0`，7 张快照落在 config 目录下而不是进程 cwd。
+- **RTSP（本地回环）**：`vendor/mediamtx.exe` 推 `vendor/test.mp4`，
+  `--rtsp rtsp://127.0.0.1:8554/test` 拉到 90 帧、12 次检测、退出码 0（test.mp4 里没有
+  YOLO 认得的 COCO 目标，所以 0 条 observation，但解码 + 检测链路是真的）。
+
+实机跑出了三个缺陷，都已修：
+
+1. **致命失败的相机在 health.json 里显示成 `starting`**：`drive()` 在构造 detector 失败
+   时直接 return，从没发布过健康数据。现在会发布 `failed` + `last_error`（§5 要求
+   `failed` 可见）。顺带：`open()` 成功后也立刻发布一次，所以"连上了但还没出帧"显示
+   `running` 而不是 `starting`。
+2. **`--model` 是 cwd 相对路径**：daemon 由服务管理器拉起时 cwd 不确定，模型找不到会让
+   每个相机在启动时死掉（实机上就是这么死的）。现在 `absolutize()` 也覆盖 `model`，
+   相对路径按 config 目录解析。**注意这与 §8.2 / §8.3 的模板不一致**：那两份模板把 config
+   放在 `/etc/where-i-put`、`WorkingDirectory` 设成 `/opt/where-i-put`，于是 `data/` 与
+   `models/` 都会解析到 `/etc/where-i-put` 下。按 §3 的规则，模板要么把数据目录放在 config
+   旁边，要么在 config 里写绝对路径。
+3. **daemon 无法驱动 webcam**：`camera_tasks()` 只认 `url`，内置摄像头根本进不了 daemon。
+   新增 `[[camera]] webcam = <index>`（`url` 优先），并补了单测。
 
 ## 5. 外部可观测：健康快照文件
 

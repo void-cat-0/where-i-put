@@ -102,6 +102,12 @@ pub struct CameraConfig {
     /// RTSP url (may embed credentials); absent for webhook-fed cameras.
     #[serde(default)]
     pub url: Option<String>,
+    /// Local/USB camera index (feature `camera`). **Not portable**: DirectShow,
+    /// V4L2 and AVFoundation enumerate different devices, so this is a
+    /// per-machine value in a way `url` is not (docs/resident-ingest.md §9).
+    /// Ignored when `url` is also set.
+    #[serde(default)]
+    pub webcam: Option<u32>,
     /// `false` keeps the camera out of the daemon without deleting its regions.
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -157,19 +163,24 @@ impl Config {
     /// One task per camera the daemon should drive: the enabled `[[camera]]`
     /// rows, in file order.
     ///
-    /// A row without a `url` is webhook-fed, so it gets `source: None` -- the
-    /// supervisor reads that as "no thread", which is the honest answer.
+    /// A `url` drives a network camera and a `webcam` index drives a local one
+    /// (`url` wins when both are set, since a network camera is the portable
+    /// choice). A row with neither is webhook-fed: it gets `source: None`, which
+    /// the supervisor reads as "no thread".
     pub fn camera_tasks(&self, settings: &RuntimeConfig) -> Vec<CameraTask> {
         self.camera
             .iter()
             .filter(|cam| cam.enabled.unwrap_or(true))
             .map(|cam| CameraTask {
                 camera_id: cam.id.clone(),
-                source: cam.url.as_deref().filter(|url| !url.is_empty()).map(|url| {
-                    SourceSpec::Rtsp {
+                source: cam
+                    .url
+                    .as_deref()
+                    .filter(|url| !url.is_empty())
+                    .map(|url| SourceSpec::Rtsp {
                         url: url.to_string(),
-                    }
-                }),
+                    })
+                    .or_else(|| cam.webcam.map(|index| SourceSpec::Webcam { index })),
                 detector: settings.detector_spec_for(Some(cam)),
                 detect_fps: settings.detect_fps_for(Some(cam)),
                 snapshot_dir: PathBuf::from(&settings.snapshots_dir),
@@ -393,10 +404,16 @@ impl RuntimeConfig {
     /// file's directory** rather than the process cwd (docs/resident-ingest.md
     /// §3). A service manager picks the cwd, so a daemon that trusted it would
     /// write snapshots where `item-web` cannot find them.
+    ///
+    /// `model` counts as one of these paths: it was cwd-relative at first, and
+    /// running the daemon from a foreign cwd made every camera die at startup
+    /// with "model load: File ... does not exist". The config's directory is the
+    /// deployment root, so a shared model needs an absolute path.
     pub fn absolutize(&mut self, base: &Path) {
         self.db = absolute(base, &self.db);
         self.snapshots_dir = absolute(base, &self.snapshots_dir);
         self.health_file = absolute(base, &self.health_file);
+        self.model = absolute(base, &self.model);
     }
 
     /// The single-instance lock lives next to the database: one writer per
@@ -613,6 +630,67 @@ id = "living"
             cfg.camera_id, "rtsp-0",
             "identity must stay stable for an unchanged command line"
         );
+    }
+
+    #[test]
+    fn a_camera_row_can_name_a_network_camera_or_a_local_one() {
+        let file = parse(
+            r#"
+[[camera]]
+id = "desk"
+webcam = 0
+
+[[camera]]
+id = "yard"
+url = "rtsp://cam.local/stream"
+
+[[camera]]
+id = "both"
+url = "rtsp://cam.local/other"
+webcam = 1
+
+[[camera]]
+id = "disabled"
+enabled = false
+webcam = 2
+
+[[camera]]
+id = "fed-by-frigate"
+"#,
+        );
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        let tasks = file.camera_tasks(&cfg);
+
+        let by_id = |id: &str| {
+            tasks
+                .iter()
+                .find(|t| t.camera_id == id)
+                .unwrap_or_else(|| panic!("no task for {id}"))
+        };
+        assert_eq!(
+            by_id("desk").source,
+            Some(SourceSpec::Webcam { index: 0 }),
+            "a webcam index drives a local camera"
+        );
+        assert_eq!(
+            by_id("yard").source,
+            Some(SourceSpec::Rtsp {
+                url: "rtsp://cam.local/stream".into()
+            })
+        );
+        assert_eq!(
+            by_id("both").source,
+            Some(SourceSpec::Rtsp {
+                url: "rtsp://cam.local/other".into()
+            }),
+            "url wins when both are set: a network camera is the portable choice"
+        );
+        assert_eq!(by_id("fed-by-frigate").source, None);
+        assert!(
+            !tasks.iter().any(|t| t.camera_id == "disabled"),
+            "enabled = false keeps a camera out of the daemon"
+        );
+        assert_eq!(tasks.len(), 4);
     }
 
     #[test]

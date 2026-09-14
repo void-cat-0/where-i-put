@@ -68,6 +68,22 @@ pub struct CameraHealth {
     pub inference_ms_ewma: f64,
 }
 
+impl Default for CameraHealth {
+    /// A camera that has not reported anything yet.
+    fn default() -> Self {
+        Self {
+            state: CameraState::Starting,
+            frames: 0,
+            detections: 0,
+            recorded: 0,
+            reconnects: 0,
+            last_frame_age: None,
+            last_error: None,
+            inference_ms_ewma: 0.0,
+        }
+    }
+}
+
 /// Owns one `FrameSource` and one `Detector`.
 ///
 /// Threading: `open()` and every `step()` must happen on the SAME thread --
