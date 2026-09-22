@@ -28,7 +28,10 @@ Crates, one-way dependencies (`item-ingest`/`item-query`/`item-web` -> `item-cor
   answers with labeled boxes, so keys/remotes beyond COCO-80 work) -> NMS ->
   zone mapping -> store. Also an axum webhook server that ingests Frigate
   events directly, skipping local detection entirely, plus an MJPEG web
-  preview bridge for RTSP cameras (`--preview`, feature `rtsp`).
+  preview bridge for RTSP cameras (`--preview`, feature `rtsp`). Runs as a
+  resident daemon (`--daemon --config`, see below) that drives every configured
+  camera at once, publishes a health snapshot, and keeps its own database and
+  snapshot directory bounded.
 - **crates/item-query** — the read side. CLI (`log`, `ask`) over observations,
   with an OpenAI-compatible VLM client (llama.cpp/Ollama/cloud sidecar) used
   only when `ITEM_VLM_BASE_URL`/`ITEM_VLM_MODEL` are set. The Rust core never
@@ -93,6 +96,137 @@ ITEM_VLM_BASE_URL=http://127.0.0.1:8080/v1 ITEM_VLM_MODEL=qwen2.5vl cargo run -p
 # webhook receiver (point Frigate event forwarding at POST /frigate/webhook)
 cargo run -p item-ingest -- --listen 127.0.0.1:8477
 ```
+
+## Resident daemon (`--daemon --config <file>`)
+
+One process for a deployment that runs for weeks: the Frigate webhook server, the
+optional preview, and one thread per `[[camera]]` row that names a source (`url`, or
+`webcam = <index>` for a local camera), all writing through one `Store`. It runs until
+it is asked to stop (Ctrl-C, or `SIGTERM` on Unix) and is the only mode that takes the
+single-instance lock at `<db dir>/ingest.lock`.
+
+```sh
+cat > config.toml <<'EOF'
+[daemon]
+db = "data/items.db"
+snapshots_dir = "data/snapshots"
+health_file = "data/health.json"
+events_file = "data/events.jsonl"   # appeared/disappeared timeline; "" = off
+checkpoint_secs = 300     # WAL checkpoint (TRUNCATE)
+retention_days = 90       # 0 = keep observations forever
+sweep_secs = 3600         # how often expired observations are pruned
+reconcile_secs = 604800   # how often orphan snapshot files are swept
+
+[webhook]
+enabled = true
+listen = "127.0.0.1:8477"
+
+[[camera]]
+id = "living"
+url = "rtsp://user:pass@192.168.1.64:554/Streaming/Channels/102"
+detector = "yolo"
+detect_fps = 1.0
+[camera.regions]                      # rects in camera pixels
+desk = [0.0, 360.0, 1280.0, 720.0]
+EOF
+
+cargo run --features "rtsp,yolo" -p item-ingest -- --daemon --config config.toml
+```
+
+Relative paths in the config resolve against **the config file's directory**, not the
+process cwd: a service manager picks the cwd, and snapshots have to land where
+`item-web` looks for them. A row with neither `url` nor `webcam` is fed by Frigate's
+webhooks; `enabled = false` keeps a camera out of the daemon without deleting its
+regions.
+
+### Is it alive? (`data/health.json`)
+
+Rewritten every 15 s, atomically (`.tmp` + rename), so readers must tolerate the file
+being briefly missing or stale:
+
+```json
+{"schema": 1, "pid": 12345, "started_at": "…", "updated_at": "2026-09-09T02:37:15Z",
+ "seq": 148, "detector_default": "yolo",
+ "cameras": [{"id": "living", "state": "running", "frames": 210344, "detections": 21033,
+              "recorded": 87, "reconnects": 3, "last_frame_age_s": 1, "last_error": null}]}
+```
+
+- **`updated_at` older than 90 s means the process is dead or hung** — the *only*
+  liveness signal. `pid` is advisory: Windows would need `OpenProcess`, Unix reuses pids.
+- `state` is `starting` / `running` / `reconnecting` / `failed` (gave up, needs a human)
+  / `stopped`.
+- `last_frame_age_s` staying above ~3x the camera's `detect_fps` means the decode side
+  is stuck. Every 5 minutes each camera also logs a `heartbeat` line, so silence never
+  looks like success.
+
+### What appeared and disappeared (`data/events.jsonl`)
+
+Each camera also keeps a timeline: an observation becomes an `appeared` line when it
+is first seen, and a `disappeared` line once it has gone unseen for `max(30s, 3/detect_fps)`.
+Append-only JSONL, one event per line, `jq`/`grep`-ready — and rotated at 64MB keeping
+two older generations, so a week of running stays bounded:
+
+```json
+{"ts":"2026-09-25T04:14:48Z","camera":"desk","zone":"frame","label":"laptop",
+ "obs_id":3,"event":"appeared","hits":1}
+{"ts":"2026-09-25T04:15:19Z","camera":"desk","zone":"frame","label":"laptop",
+ "obs_id":3,"event":"disappeared","hits":1,"seen_for_s":30.5}
+```
+
+`hits` and `seen_for_s` describe the **last sighting** (not the moment the sweep ran),
+which is what makes them comparable with the row's own `hit_count` and its
+`last_seen - first_seen`. A `daemon_started` marker separates each run, so a
+disappearance is never read across a restart boundary. On shutdown every still-open key
+is closed first — otherwise the last real disappearance of a run would be lost.
+
+**This file is an observation, not the truth.** It exists to gather real evidence for
+the data-model v2 events table (see the roadmap); nothing reads it back as state.
+`webhook`-fed cameras produce no events: Frigate sends discrete events with no
+continuous frames, so a disappearance can never be observed there.
+
+### Keeping it bounded (`--maintenance`)
+
+Observations older than `retention_days` (by `last_seen`) are pruned, each taking its
+snapshot JPEG with it; every `reconcile_secs` a pass deletes snapshot files whose row is
+gone. VACUUM is never automatic — run it on demand, with the daemon stopped:
+
+```sh
+item-ingest --maintenance --config config.toml          # refuses while a daemon holds the lock
+item-ingest --maintenance --force --config config.toml  # only for a lock left by a killed daemon
+```
+
+The 90-day default is deliberate: the roadmap's containment inference needs exactly the
+disappearance history this deletes. Read the comment on
+`config::defaults::RETENTION_DAYS` before lowering it.
+
+**One camera, one source**: a camera is either fed by Frigate or driven locally, never
+both. Frigate sends only discrete events (no frames, so no disappearance can be
+observed), and both paths on one camera produce two observations of the same object
+fighting over the same zone.
+
+### Running it as a service (restart, and surviving a kill)
+
+Ready-to-edit templates for the three platforms live in [`deploy/`](deploy/README.md):
+a systemd unit, a launchd plist, and a Windows Task Scheduler script. Each one gives
+the daemon a 30 s stop budget, which is what its 10 s camera drain plus final health
+write and WAL checkpoint need.
+
+They rely on two behaviours worth knowing about:
+
+- **A killed daemon does not wedge the next start.** The single-instance lock file at
+  `<db dir>/ingest.lock` is re-stamped every 15 s while the daemon runs. A start that
+  finds a lock silent for 45 s **takes it over** — logging
+  `previous run died without shutdown` — instead of refusing forever. A `health.json`
+  written in the last 90 s vetoes that takeover, so a live-but-wedged daemon is never
+  robbed of its lock; the conservative side of that trade is that a restart right after
+  a hard kill waits out those windows (~90 s) before it can take over.
+- **The stop signals are the ones a service manager sends.** `SIGTERM`/`SIGINT`/`SIGHUP`
+  on Unix; on Windows the console events (`Ctrl-C`, `Ctrl-Break`, console close, logoff,
+  shutdown). A clean stop drains camera threads, writes a final health snapshot, closes
+  every open event key and checkpoints the WAL before exiting 0.
+
+`--maintenance` keeps the strict form: it never takes over a lock, because a human is
+running it and the alternative to refusing is deleting data the daemon may be writing.
 
 ## RTSP backend (`--features rtsp`)
 
@@ -213,7 +347,9 @@ in/under the box, now on the shelf"), never as fact. Building blocks, in order:
    and the covering event are temporal facts only continuous observation
    produces — sporadic manual runs never see them. Design draft (process model,
    config, health file, retention, event observation):
-   [docs/resident-ingest.md](docs/resident-ingest.md).
+   [docs/resident-ingest.md](docs/resident-ingest.md). **P0–P3 landed** (process
+   split, daemon skeleton, health/heartbeat/backoff, retention + `--maintenance`);
+   P4 (event observation) and P5 (service units) are still open.
 2. **Data model v2**: persist per-observation bboxes (the DB currently stores
    zone + a burned-in snapshot only, no coordinates) and an events table
    (appeared / disappeared / covered / moved).

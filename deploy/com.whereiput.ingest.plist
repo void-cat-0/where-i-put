@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  where-i-put resident ingest — launchd plist (macOS).
+
+  Two install locations, two different lifetimes:
+    ~/Library/LaunchAgents/com.whereiput.ingest.plist     starts at login, runs as you
+    /Library/LaunchDaemons/com.whereiput.ingest.plist     starts at boot, runs as root
+
+  Install (agent, no sudo):
+    cp deploy/com.whereiput.ingest.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.whereiput.ingest.plist
+    launchctl print gui/$(id -u)/com.whereiput.ingest        # status
+  Uninstall:
+    launchctl bootout gui/$(id -u)/com.whereiput.ingest
+
+  BEFORE INSTALLING, change: every /opt/where-i-put path below, and make sure
+  the log directory EXISTS — launchd does not create it, and a missing
+  StandardErrorPath is where a crash's only evidence goes.
+
+  Absolute paths matter: the daemon resolves relative config paths against the
+  config file's directory (§3), not WorkingDirectory, so keep config and data
+  in one tree or write absolute paths in the config.
+
+  KeepAlive restarts on any exit, including a clean stop — which is what you
+  want from a service that should always be running. ExitTimeOut is the §3
+  shutdown budget: launchd sends SIGTERM (handled), then SIGKILL after this.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.whereiput.ingest</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/where-i-put/item-ingest</string>
+    <string>--daemon</string>
+    <string>--config</string>
+    <string>/opt/where-i-put/config.toml</string>
+  </array>
+
+  <key>WorkingDirectory</key><string>/opt/where-i-put</string>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+
+  <!-- §3's 10s camera drain + final health write, with room to spare. -->
+  <key>ExitTimeOut</key><integer>30</integer>
+
+  <!-- launchd will NOT create this directory: mkdir -p it first. -->
+  <key>StandardOutPath</key><string>/opt/where-i-put/data/ingest.out.log</string>
+  <key>StandardErrorPath</key><string>/opt/where-i-put/data/ingest.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key><string>info</string>
+  </dict>
+</dict>
+</plist>

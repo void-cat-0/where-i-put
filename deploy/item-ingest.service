@@ -1,0 +1,59 @@
+# where-i-put resident ingest -- systemd unit (Linux).
+#
+# Install:
+#   sudo cp deploy/item-ingest.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now item-ingest
+#   journalctl -u item-ingest -f          # no file redirection needed
+#
+# BEFORE INSTALLING, change four things:
+#   1. User=            a dedicated account that can read the camera device
+#                       (usually the `video` group: `usermod -aG video whereiput`)
+#   2. WorkingDirectory + ExecStart   where the binary and models/ live
+#   3. --config path    the deployment's config.toml
+#   4. ReadWritePaths   every directory the config writes into
+#
+# Absolute paths matter here. The daemon resolves relative paths against the
+# CONFIG FILE's directory (docs/resident-ingest.md §3), not the cwd, so a
+# config that says `db = "data/items.db"` writes next to the config file --
+# put the config and its data directory in the same tree, or use absolute
+# paths in the config. Listing /etc/where-i-put as writable would be the
+# mistake to avoid: configuration stays read-only, data goes elsewhere.
+
+[Unit]
+Description=where-i-put resident ingest (cameras -> observations)
+Documentation=https://github.com/void-cat-0/where-i-put
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=whereiput
+Group=whereiput
+WorkingDirectory=/opt/where-i-put
+ExecStart=/opt/where-i-put/item-ingest --daemon --config /etc/where-i-put/config.toml
+
+# The daemon exits 0 on a stop signal and non-zero only on a real failure, so
+# this restarts what crashed and not what was stopped on purpose. A killed
+# daemon leaves a lock whose heartbeat stops; the next start takes it over
+# (docs/resident-ingest.md §8), which is what makes this line useful.
+Restart=on-failure
+RestartSec=5
+
+# SIGTERM is systemd's default stop signal and the daemon handles it. The
+# budget covers §3's 10s camera drain plus final health write and checkpoint;
+# systemd sends SIGKILL after this.
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+Environment=RUST_LOG=info
+
+# Configuration and the binary are read-only to the service; only the data
+# directory is writable. `data/` here is the tree the config points at.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/where-i-put
+
+[Install]
+WantedBy=multi-user.target

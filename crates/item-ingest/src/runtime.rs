@@ -107,6 +107,10 @@ pub struct CameraTask {
     pub detector: DetectorSpec,
     pub detect_fps: f64,
     pub snapshot_dir: PathBuf,
+    /// Where this camera's appeared/disappeared timeline is appended, or `None`
+    /// to run without one (docs/resident-ingest.md §6). A file rather than a
+    /// handle so the daemon can hand the same path to every camera.
+    pub events_path: Option<PathBuf>,
     /// Stop after this many frames; 0 = run until stopped.
     pub max_frames: u64,
     pub enabled: bool,
@@ -273,6 +277,7 @@ mod tests {
             detector: DetectorSpec::Null,
             detect_fps: 1.0,
             snapshot_dir: PathBuf::from("unused"),
+            events_path: None,
             max_frames: 0,
             enabled: true,
         }

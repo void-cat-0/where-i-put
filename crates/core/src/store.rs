@@ -84,7 +84,11 @@ impl Store {
                  sample_snapshot TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_obs_lookup
-                 ON observations (label, zone, camera_id, last_seen DESC);",
+                 ON observations (label, zone, camera_id, last_seen DESC);
+             -- The retention sweep deletes by `last_seen` alone, which the
+             -- lookup index above cannot serve (label is its leading column).
+             CREATE INDEX IF NOT EXISTS idx_obs_last_seen
+                 ON observations (last_seen);",
         )?;
         Ok(())
     }
@@ -135,10 +139,10 @@ impl Store {
     // ---- observations ------------------------------------------------------
 
     /// Merge with the latest observation of (camera, zone, label) if it is
-    /// still open, otherwise insert a fresh row. Returns (row id, is_new):
-    /// the caller writes a snapshot exactly when is_new, so every
-    /// observation gets one representative image without re-storing on
-    /// every merge.
+    /// still open, otherwise insert a fresh row. Returns (row id, is_new,
+    /// hit_count): the caller writes a snapshot exactly when is_new, and uses
+    /// `hit_count` for the disappearance events of docs/resident-ingest.md §6,
+    /// which report how many times the object was seen before it went.
     pub fn record_sighting(
         &self,
         camera_id: &str,
@@ -147,7 +151,7 @@ impl Store {
         seen_at: DateTime<Utc>,
         snapshot: Option<&str>,
         window: Duration,
-    ) -> Result<(i64, bool)> {
+    ) -> Result<(i64, bool, i64)> {
         let cutoff =
             seen_at - chrono::Duration::from_std(window).expect("window fits chrono range");
         let existing: Option<(i64, String)> = self
@@ -162,14 +166,18 @@ impl Store {
             .ok();
 
         if let Some((id, _)) = existing {
-            self.conn.execute(
+            // `RETURNING hit_count` reads back the value the same statement
+            // just wrote, so the count costs no extra round trip.
+            let hits: i64 = self.conn.query_row(
                 "UPDATE observations
                  SET last_seen = ?2, hit_count = hit_count + 1,
                      sample_snapshot = COALESCE(sample_snapshot, ?3)
-                 WHERE id = ?1",
+                 WHERE id = ?1
+                 RETURNING hit_count",
                 params![id, seen_at.to_rfc3339(), snapshot],
+                |r| r.get(0),
             )?;
-            return Ok((id, false));
+            return Ok((id, false, hits));
         }
 
         self.conn.execute(
@@ -178,7 +186,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?4, 1, ?5)",
             params![camera_id, zone, label, seen_at.to_rfc3339(), snapshot],
         )?;
-        Ok((self.conn.last_insert_rowid(), true))
+        Ok((self.conn.last_insert_rowid(), true, 1))
     }
 
     /// Attach (or replace) an observation's snapshot path after the fact.
@@ -250,6 +258,62 @@ impl Store {
                 })
         }
     }
+
+    // ---- retention (docs/resident-ingest.md §7) ---------------------------
+
+    /// Delete every observation last seen before `cutoff`, returning the ids
+    /// that went away. The caller deletes those snapshots **after** this
+    /// returns: a JPEG left behind is an orphan, a row pointing at a deleted
+    /// file is a broken observation, and only one of those is acceptable.
+    ///
+    /// One statement (`DELETE ... RETURNING`), so the returned ids are exactly
+    /// the rows the delete removed. The iterator must be drained -- SQLite
+    /// applies the deletion as the rows are stepped.
+    ///
+    /// `last_seen` is stored as RFC3339 text and compared as text, which orders
+    /// correctly for the fixed-offset format chrono writes; the dedup window in
+    /// [`Store::record_sighting`] already relies on the same property.
+    pub fn expire_observations(&self, cutoff: DateTime<Utc>) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("DELETE FROM observations WHERE last_seen < ?1 RETURNING id")?;
+        let rows = stmt.query_map(params![cutoff.to_rfc3339()], |r| r.get::<_, i64>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
+    /// Every observation id, ascending. Read once up front so the orphan scan
+    /// can decide what a snapshot file may belong to without holding the store
+    /// lock while it walks the directory (§3: no heavy work under the lock).
+    pub fn observation_ids(&self) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM observations ORDER BY id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
+    pub fn count_observations(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))?)
+    }
+
+    /// Rewrite the database file, reclaiming the space deleted rows left
+    /// behind. Deliberately never automatic: it holds an exclusive lock for as
+    /// long as the rewrite takes, so the daemon only does it on request
+    /// (`item-ingest --maintenance`, §7).
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -264,7 +328,7 @@ mod tests {
     #[test]
     fn sightings_merge_within_window_then_split_after() {
         let s = Store::in_memory().unwrap();
-        let (id1, new1) = s
+        let (id1, new1, hits1) = s
             .record_sighting(
                 "cam1",
                 "entrance",
@@ -275,8 +339,9 @@ mod tests {
             )
             .unwrap();
         assert!(new1);
+        assert_eq!(hits1, 1, "a fresh row has seen the object once");
         // +1 min: merged into the same observation
-        let (id2, new2) = s
+        let (id2, new2, hits2) = s
             .record_sighting(
                 "cam1",
                 "entrance",
@@ -288,8 +353,12 @@ mod tests {
             .unwrap();
         assert!(!new2);
         assert_eq!(id1, id2);
+        assert_eq!(
+            hits2, 2,
+            "the merge reports the count it just wrote (§6's `hits`)"
+        );
         // +10 min: outside the 5-min window -> a new observation
-        let (id3, new3) = s
+        let (id3, new3, hits3) = s
             .record_sighting(
                 "cam1",
                 "entrance",
@@ -301,6 +370,7 @@ mod tests {
             .unwrap();
         assert!(new3);
         assert_ne!(id1, id3);
+        assert_eq!(hits3, 1, "the new row starts its own count");
 
         let obs = s.recent(Some("keys"), 10).unwrap();
         assert_eq!(obs.len(), 2);
@@ -323,7 +393,7 @@ mod tests {
     #[test]
     fn snapshot_attached_after_insert() {
         let s = Store::in_memory().unwrap();
-        let (id, _) = s
+        let (id, _, _) = s
             .record_sighting("cam1", "desk", "keys", ts(0), None, DEFAULT_DEDUP_WINDOW)
             .unwrap();
         assert!(
@@ -338,5 +408,62 @@ mod tests {
                 .as_deref(),
             Some("snapshots/1.jpg")
         );
+    }
+
+    #[test]
+    fn the_sweep_deletes_only_what_is_past_the_cutoff_and_names_what_it_took() {
+        let s = Store::in_memory().unwrap();
+        let (old_id, _, _) = s
+            .record_sighting(
+                "cam1",
+                "desk",
+                "keys",
+                ts(0),
+                Some("snapshots/1.jpg"),
+                DEFAULT_DEDUP_WINDOW,
+            )
+            .unwrap();
+        let (new_id, _, _) = s
+            .record_sighting("cam1", "desk", "cup", ts(10), None, DEFAULT_DEDUP_WINDOW)
+            .unwrap();
+
+        let expired = s.expire_observations(ts(5)).unwrap();
+        assert_eq!(
+            expired,
+            vec![old_id],
+            "the sweep must report exactly the rows it deleted, so the caller can delete those files"
+        );
+        assert_eq!(s.observation_ids().unwrap(), vec![new_id]);
+        assert_eq!(s.count_observations().unwrap(), 1);
+        assert_eq!(s.recent(None, 10).unwrap()[0].label, "cup");
+    }
+
+    #[test]
+    fn a_row_exactly_at_the_cutoff_survives() {
+        let s = Store::in_memory().unwrap();
+        let (id, _, _) = s
+            .record_sighting("cam1", "desk", "keys", ts(5), None, DEFAULT_DEDUP_WINDOW)
+            .unwrap();
+        assert!(
+            s.expire_observations(ts(5)).unwrap().is_empty(),
+            "the window is `last_seen < cutoff`, so a row on the boundary is kept"
+        );
+        assert_eq!(s.observation_ids().unwrap(), vec![id]);
+    }
+
+    #[test]
+    fn vacuum_leaves_the_surviving_rows_alone() {
+        let s = Store::in_memory().unwrap();
+        s.record_sighting("cam1", "desk", "cup", ts(0), None, DEFAULT_DEDUP_WINDOW)
+            .unwrap();
+        let (fresh, _, _) = s
+            .record_sighting("cam1", "desk", "keys", ts(10), None, DEFAULT_DEDUP_WINDOW)
+            .unwrap();
+        s.expire_observations(ts(5)).unwrap();
+
+        s.vacuum().unwrap();
+        assert_eq!(s.count_observations().unwrap(), 1);
+        assert_eq!(s.observation_ids().unwrap(), vec![fresh]);
+        assert_eq!(s.recent(None, 10).unwrap()[0].label, "keys");
     }
 }

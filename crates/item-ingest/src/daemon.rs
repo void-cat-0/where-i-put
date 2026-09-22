@@ -17,17 +17,20 @@
 //! `#[cfg(unix)]` split -- see [`wait_for_signal`].
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use chrono::Utc;
 use item_core::store::Store;
 
 use crate::SharedStore;
 use crate::config::{Config, RuntimeConfig};
 use crate::health::{CameraMeta, HealthRegistry, HealthWriter};
 use crate::lock::SingleInstance;
+use crate::retention;
 use crate::runtime::{self, CameraTask};
 use crate::supervisor::Supervisor;
 
@@ -41,7 +44,7 @@ pub const HEALTH_INTERVAL: Duration = Duration::from_secs(15);
 /// never be indistinguishable from success.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Resolution of the health/heartbeat timers.
+/// Resolution of the health/heartbeat/maintenance timers.
 const TICK: Duration = Duration::from_millis(200);
 
 /// Run the daemon until a stop signal arrives. Wires the stop flag to the
@@ -74,13 +77,29 @@ pub fn run_with_stop(
 
     // Before anything opens the database: two writers on one WAL file is the
     // failure that corrupts data quietly (§1).
-    let lock = SingleInstance::acquire(&settings.lock_path())
+    //
+    // This is the recoverable form (§8): a service manager restarting a killed
+    // daemon must not be refused forever by the wreckage the kill left behind.
+    // The health file's `updated_at` (§5) is read first and passed as evidence,
+    // so a daemon that is alive but between lock heartbeats keeps its lock.
+    let health_written_at = read_health_updated_at(&settings.health_file);
+    let lock = SingleInstance::acquire_or_recover(&settings.lock_path(), health_written_at)
         .context("refusing to start a second ingest daemon")?;
     tracing::info!(
         lock = %lock.path().display(),
         pid = std::process::id(),
+        recovered = lock.recovered().is_some(),
         "single-instance lock acquired"
     );
+    if let Some(recovered) = lock.recovered() {
+        // §8's "previous run died without shutdown", now an observed fact
+        // rather than a guess: the lock stopped beating and no health file
+        // contradicted it. The lock module already logged the previous holder.
+        tracing::warn!(
+            reason = recovered.reason(),
+            "previous run died without shutdown"
+        );
+    }
 
     let store: SharedStore = Arc::new(Mutex::new(
         Store::open(&settings.db).context("opening sqlite store")?,
@@ -121,6 +140,32 @@ pub fn run_with_stop(
     supervisor.start(&store, tasks);
     tracing::info!("camera threads started");
 
+    // The lock heartbeat (§8): a running holder keeps its file's mtime moving
+    // so the next start can tell a live daemon from wreckage. It runs on its
+    // own plain thread and shares only the path -- the `SingleInstance` guard
+    // itself is owned here and released on drop.
+    let lock_heartbeat_thread = {
+        let stop = Arc::clone(&stop);
+        let lock_path = lock.path().to_path_buf();
+        std::thread::Builder::new()
+            .name("lock-heartbeat".to_string())
+            .spawn(move || {
+                let mut until_beat = crate::lock::HEARTBEAT;
+                while !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(TICK);
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    until_beat = until_beat.saturating_sub(TICK);
+                    if until_beat.is_zero() {
+                        crate::lock::touch(&lock_path);
+                        until_beat = crate::lock::HEARTBEAT;
+                    }
+                }
+            })
+            .context("spawning the lock heartbeat thread")?
+    };
+
     // The health cadence runs on a plain thread so it keeps ticking while the
     // async side is parked on a signal.
     let health_thread = {
@@ -157,6 +202,11 @@ pub fn run_with_stop(
         .listen
         .parse()
         .context("bad listen address (--listen / [webhook] listen)")?;
+
+    // Bounded growth (§7): WAL checkpoints, the retention sweep and the orphan
+    // scan, all off when their interval is 0.
+    let maintenance_thread = spawn_maintenance(Arc::clone(&store), &settings, Arc::clone(&stop))
+        .context("spawning the maintenance thread")?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -199,6 +249,8 @@ pub fn run_with_stop(
     }
 
     let _ = health_thread.join();
+    let _ = lock_heartbeat_thread.join();
+    let _ = maintenance_thread.join();
     // One last snapshot: after this write, `updated_at` is the process's final
     // word, which is what P1's acceptance checks.
     write_health(&writer, &registry);
@@ -213,6 +265,162 @@ pub fn run_with_stop(
     drop(lock);
     tracing::info!("ingest daemon stopped");
     Ok(())
+}
+
+/// One periodic job. A zero interval means the job is off -- which is why the
+/// countdown cannot simply be compared against zero: an off job would then fire
+/// on every tick.
+#[derive(Debug, Clone, Copy)]
+struct Cadence {
+    /// Zero = off.
+    interval: Duration,
+    until: Duration,
+}
+
+impl Cadence {
+    /// First run one interval from now.
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            until: interval,
+        }
+    }
+
+    /// First run on the next tick -- for work that should happen at startup
+    /// (a daemon that was down for a month prunes as soon as it comes back).
+    fn due_now(interval: Duration) -> Self {
+        Self {
+            interval,
+            until: Duration::ZERO,
+        }
+    }
+
+    fn off() -> Self {
+        Self {
+            interval: Duration::ZERO,
+            until: Duration::ZERO,
+        }
+    }
+
+    /// Advance by `elapsed`; `true` when the job is due now.
+    fn tick(&mut self, elapsed: Duration) -> bool {
+        if self.interval.is_zero() {
+            return false;
+        }
+        self.until = self.until.saturating_sub(elapsed);
+        if self.until.is_zero() {
+            self.until = self.interval;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The health file's `updated_at`, as the lock takeover's evidence (§5/§8).
+/// `None` when the file is missing or unreadable -- which must not veto a
+/// takeover, or a first-ever start would refuse itself.
+fn read_health_updated_at(path: &str) -> Option<chrono::DateTime<Utc>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(value.get("updated_at")?.as_str()?).ok()?;
+    Some(parsed.with_timezone(&Utc))
+}
+
+/// Checkpoints, pruning and the orphan scan on their own thread, so they keep
+/// running while the async side is parked on a signal and never sit in the
+/// frame path of a camera.
+///
+/// Every failure here is logged and survived: a locked database or an
+/// undeletable file must not take the daemon down (§7).
+fn spawn_maintenance(
+    store: SharedStore,
+    settings: &RuntimeConfig,
+    stop: Arc<AtomicBool>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let window = settings.retention_window();
+    let snapshots_dir = PathBuf::from(&settings.snapshots_dir);
+    let mut checkpoint = Cadence::new(Duration::from_secs(settings.checkpoint_secs));
+    let mut sweep = match window {
+        Some(_) => Cadence::due_now(Duration::from_secs(settings.sweep_secs)),
+        None => Cadence::off(),
+    };
+    let mut reconcile = Cadence::new(Duration::from_secs(settings.reconcile_secs));
+    tracing::info!(
+        checkpoint_secs = settings.checkpoint_secs,
+        sweep_secs = settings.sweep_secs,
+        reconcile_secs = settings.reconcile_secs,
+        retention_days = settings.retention_days,
+        snapshots_dir = %snapshots_dir.display(),
+        "maintenance scheduled"
+    );
+
+    std::thread::Builder::new()
+        .name("maintenance".to_string())
+        .spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(TICK);
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if checkpoint.tick(TICK) {
+                    checkpoint_wal(&store);
+                }
+                if sweep.tick(TICK)
+                    && let Some(window) = window
+                {
+                    prune_once(&store, &snapshots_dir, window);
+                }
+                if reconcile.tick(TICK) {
+                    reconcile_once(&store, &snapshots_dir);
+                }
+            }
+        })
+}
+
+fn checkpoint_wal(store: &SharedStore) {
+    let store = store.lock().expect("store mutex poisoned");
+    match store.checkpoint() {
+        Ok(()) => tracing::debug!("wal checkpointed"),
+        Err(e) => tracing::warn!(error = %e, "wal checkpoint failed"),
+    }
+}
+
+/// One retention pass. An empty pass logs at debug: at the default cadence it
+/// is the common case, and the point of the log line is the pass that deleted
+/// something.
+fn prune_once(store: &SharedStore, snapshots_dir: &Path, window: Duration) {
+    match retention::prune(store, snapshots_dir, window, Utc::now()) {
+        Ok(report) if report.rows_deleted == 0 && report.files_deleted == 0 => {
+            tracing::debug!(
+                kept = report.files_kept,
+                "retention sweep: nothing to prune"
+            )
+        }
+        Ok(report) => tracing::info!(
+            rows = report.rows_deleted,
+            files = report.files_deleted,
+            kib = report.bytes_freed / 1024,
+            kept = report.files_kept,
+            "retention sweep"
+        ),
+        Err(e) => tracing::warn!(error = %e, "retention sweep failed"),
+    }
+}
+
+fn reconcile_once(store: &SharedStore, snapshots_dir: &Path) {
+    match retention::reconcile(store, snapshots_dir) {
+        Ok(report) if report.files_deleted == 0 => {
+            tracing::debug!(kept = report.files_kept, "orphan scan: no orphans")
+        }
+        Ok(report) => tracing::info!(
+            files = report.files_deleted,
+            kib = report.bytes_freed / 1024,
+            kept = report.files_kept,
+            "orphan scan"
+        ),
+        Err(e) => tracing::warn!(error = %e, "orphan scan failed"),
+    }
 }
 
 /// Refuse to start when a camera needs a source this build cannot open. That is
@@ -293,22 +501,43 @@ fn write_health(writer: &Mutex<HealthWriter>, registry: &HealthRegistry) {
     }
 }
 
-/// Resolves when the process is asked to stop: a console stop event (Ctrl-C)
-/// anywhere, plus `SIGTERM` on Unix -- that is what systemd and launchd send,
-/// and Windows has no `SIGTERM` to send.
+/// Resolves when the process is asked to stop.
+///
+/// The stop sources differ by platform, and §8 requires each service manager's
+/// own signal to work:
+///
+/// - Unix (systemd / launchd): `SIGTERM` and `SIGINT`, plus `SIGHUP` -- a
+///   terminal hangup or a `launchctl kickstart -k` should also drain cleanly
+///   rather than drop the process.
+/// - Windows: the console control events. `Ctrl-C` is the interactive one;
+///   `Ctrl-Break` is what many service wrappers and `GenerateConsoleCtrlEvent`
+///   send; `Ctrl-Close`/`Ctrl-Logoff`/`Ctrl-Shutdown` are what a console window
+///   closing, a user logging off, or the machine shutting down deliver. All of
+///   them mean "stop now, while you still can", and all of them are available
+///   through `tokio::signal::windows` -- no raw `SetConsoleCtrlHandler` needed.
 async fn wait_for_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
+
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::hangup()),
+        ) {
+            (Ok(mut term), Ok(mut int), Ok(mut hup)) => {
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => tracing::info!("stop signal: Ctrl-C"),
                     _ = term.recv() => tracing::info!("stop signal: SIGTERM"),
+                    _ = int.recv() => tracing::info!("stop signal: SIGINT"),
+                    _ = hup.recv() => tracing::info!("stop signal: SIGHUP"),
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "could not install a SIGTERM handler; only Ctrl-C will stop the daemon");
+            _ => {
+                // One source failing must not cost us the others; Ctrl-C is the
+                // one every Unix console has.
+                tracing::warn!(
+                    "could not install every signal handler; falling back to Ctrl-C only"
+                );
                 let _ = tokio::signal::ctrl_c().await;
                 tracing::info!("stop signal: Ctrl-C");
             }
@@ -316,10 +545,37 @@ async fn wait_for_signal() {
     }
     #[cfg(not(unix))]
     {
-        // Windows: the console delivers Ctrl-C here. Ctrl-Break would need the
-        // raw `SetConsoleCtrlHandler` API, which tokio does not wrap.
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("stop signal: console interrupt");
+        use tokio::signal::windows;
+
+        // Each listener is independent: one failing to install degrades to the
+        // remaining sources rather than aborting startup.
+        let mut ctrl_c = windows::ctrl_c().ok();
+        let mut ctrl_break = windows::ctrl_break().ok();
+        let mut ctrl_close = windows::ctrl_close().ok();
+        let mut ctrl_logoff = windows::ctrl_logoff().ok();
+        let mut ctrl_shutdown = windows::ctrl_shutdown().ok();
+
+        // Await one optional listener, or never resolve when it is absent.
+        macro_rules! stopped {
+            ($listener:ident) => {
+                async {
+                    match $listener.as_mut() {
+                        Some(l) => {
+                            l.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                }
+            };
+        }
+
+        tokio::select! {
+            _ = stopped!(ctrl_c) => tracing::info!("stop signal: Ctrl-C"),
+            _ = stopped!(ctrl_break) => tracing::info!("stop signal: Ctrl-Break"),
+            _ = stopped!(ctrl_close) => tracing::info!("stop signal: console close"),
+            _ = stopped!(ctrl_logoff) => tracing::info!("stop signal: logoff"),
+            _ = stopped!(ctrl_shutdown) => tracing::info!("stop signal: system shutdown"),
+        }
     }
 }
 
@@ -353,6 +609,7 @@ mod tests {
             detector: DetectorSpec::Null,
             detect_fps: 1.0,
             snapshot_dir: std::path::PathBuf::from("unused"),
+            events_path: None,
             max_frames: 0,
             enabled: true,
         }
@@ -383,6 +640,7 @@ mod tests {
             settings.db = self.path("items.db").display().to_string();
             settings.snapshots_dir = self.path("snapshots").display().to_string();
             settings.health_file = self.path("health.json").display().to_string();
+            settings.events_file = self.path("events.jsonl").display().to_string();
             settings.webhook_enabled = false;
             settings
         }
@@ -405,6 +663,109 @@ mod tests {
         false
     }
 
+    fn wait_until(within: Duration, mut check: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        check()
+    }
+
+    /// Count rows the way `item-web` reads them: a second, read-only connection
+    /// while the daemon writes.
+    fn count_rows(db: &std::path::Path) -> i64 {
+        Store::open_read_only(db)
+            .and_then(|store| store.count_observations())
+            .unwrap_or(-1)
+    }
+
+    #[test]
+    fn a_cadence_that_is_off_never_fires() {
+        let mut off = Cadence::off();
+        for _ in 0..100 {
+            assert!(
+                !off.tick(TICK),
+                "a zero interval must not mean 'every tick'"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cadence_fires_on_its_interval_and_not_before() {
+        let mut cadence = Cadence::new(Duration::from_secs(1));
+        assert!(!cadence.tick(Duration::from_millis(999)));
+        assert!(cadence.tick(Duration::from_millis(1)));
+        assert!(!cadence.tick(Duration::from_millis(999)));
+        assert!(cadence.tick(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn a_cadence_can_be_due_immediately() {
+        let mut cadence = Cadence::due_now(Duration::from_secs(3600));
+        assert!(cadence.tick(TICK), "startup work runs on the first tick");
+        assert!(!cadence.tick(TICK));
+        assert!(!cadence.tick(Duration::from_secs(3599)));
+        assert!(cadence.tick(Duration::from_secs(1)));
+    }
+
+    /// P3's core promise, end to end: a daemon that comes back to a database
+    /// holding rows older than its window prunes them -- and their snapshots --
+    /// without being asked.
+    #[test]
+    fn the_daemon_prunes_what_is_past_the_window_as_soon_as_it_starts() {
+        let sandbox = Sandbox::new("prune");
+        let snapshots = sandbox.path("snapshots");
+        std::fs::create_dir_all(&snapshots).unwrap();
+
+        let stale_file = snapshots.join("1.jpg");
+        {
+            let store = Store::open(sandbox.path("items.db")).unwrap();
+            let (id, _, _) = store
+                .record_sighting(
+                    "cam",
+                    "desk",
+                    "keys",
+                    Utc::now() - chrono::Duration::days(2),
+                    Some(&stale_file.display().to_string()),
+                    item_core::store::DEFAULT_DEDUP_WINDOW,
+                )
+                .unwrap();
+            assert_eq!(id, 1, "the snapshot file name comes from the row id");
+            std::fs::write(&stale_file, b"jpeg-ish").unwrap();
+        }
+
+        let mut settings = sandbox.settings();
+        settings.retention_days = 1;
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || run_with_stop(settings, vec![mock_task("cam")], None, stop))
+        };
+
+        assert!(
+            wait_until(Duration::from_secs(10), || count_rows(
+                &sandbox.path("items.db")
+            ) == 0),
+            "the expired row must be gone"
+        );
+        // prune() deletes the row while holding the store lock and unlinks the
+        // file only after releasing it, so the file lags the row by design:
+        // waiting for the row is not proof the file is gone yet.
+        assert!(
+            wait_until(Duration::from_secs(10), || !stale_file.exists()),
+            "and its snapshot with it"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("daemon thread")
+            .expect("clean shutdown");
+    }
+
     #[test]
     fn unsupported_sources_are_refused_before_the_daemon_starts() {
         let mut task = mock_task("cam");
@@ -414,7 +775,11 @@ mod tests {
                 e.to_string().contains("rebuild with --features camera"),
                 "{e}"
             ),
-            // Only a build that can actually open a webcam may accept this.
+            // Only a build that can actually open a webcam may accept this. The
+            // constant is the point: reaching this arm at all means the build
+            // has the feature. (A `const` block, clippy's suggestion, would be
+            // evaluated while compiling and break the featureless build.)
+            #[allow(clippy::assertions_on_constants)]
             Ok(()) => assert!(cfg!(feature = "camera"), "no camera feature, yet accepted"),
         }
     }
@@ -483,5 +848,108 @@ mod tests {
 
         stop.store(true, Ordering::SeqCst);
         let _ = handle.join();
+    }
+
+    /// §8's restart case, end to end at the daemon level: a killed daemon left
+    /// a silent lock file, and the next start takes it over -- with a stale
+    /// health file agreeing -- instead of being refused forever.
+    #[test]
+    fn a_daemon_takes_over_a_lock_left_by_a_killed_one() {
+        let sandbox = Sandbox::new("takeover");
+        let lock_path = sandbox.path("ingest.lock");
+        let health_path = sandbox.path("health.json");
+
+        // Wreckage: a lock file with both its heartbeat and its health file
+        // long past §5's 90s rule.
+        let mut settings = sandbox.settings();
+        {
+            let killed = SingleInstance::acquire(&lock_path).unwrap();
+            std::mem::forget(killed); // a hard kill runs no Drop
+        }
+        // Backdate: the lock's mtime and the health stamp must both be old.
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        std::fs::write(
+            &health_path,
+            serde_json::json!({
+                "schema": 1,
+                "updated_at": (Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // A fresh run must start, and must replace the lock with its own.
+        settings.webhook_enabled = false;
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || run_with_stop(settings, vec![mock_task("cam")], None, stop))
+        };
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                std::fs::read_to_string(&lock_path)
+                    .map(|body| body.contains(&format!("pid={}", std::process::id())))
+                    .unwrap_or(false)
+            }),
+            "the new daemon must hold the lock it took over"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        let result = handle.join().expect("daemon thread must not panic");
+        assert!(
+            result.is_ok(),
+            "the takeover run shuts down cleanly: {result:?}"
+        );
+        assert!(!lock_path.exists(), "and releases the lock on the way out");
+    }
+
+    /// The opposite case: a fresh health stamp outvotes a silent lock, so a
+    /// wedged-but-live daemon is not robbed of its lock by an impatient
+    /// restart.
+    #[test]
+    fn a_daemon_does_not_steal_a_lock_whose_daemon_still_looks_alive() {
+        let sandbox = Sandbox::new("noveto");
+        let lock_path = sandbox.path("ingest.lock");
+        let health_path = sandbox.path("health.json");
+
+        {
+            let wedged = SingleInstance::acquire(&lock_path).unwrap();
+            std::mem::forget(wedged);
+        }
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // The health file was written moments ago: the daemon is alive, merely
+        // between lock heartbeats.
+        std::fs::write(
+            &health_path,
+            serde_json::json!({
+                "schema": 1,
+                "updated_at": Utc::now().to_rfc3339(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let err = run_with_stop(
+            sandbox.settings(),
+            vec![mock_task("cam")],
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect_err("a live-looking daemon keeps its lock");
+        let message = format!("{err:#}");
+        assert!(message.contains("already running"), "{message}");
     }
 }

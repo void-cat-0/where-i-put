@@ -26,6 +26,25 @@ use crate::runner::CameraHealth;
 /// Bumped whenever the shape below changes; readers must check it.
 pub const SCHEMA: u32 = 1;
 
+/// §5's liveness rule: an `updated_at` older than this means the process is
+/// dead or hung. It is the **only** liveness signal -- `pid` is advisory
+/// (Windows needs `OpenProcess`, Unix reuses pids), so nothing may decide on
+/// it.
+pub const STALE_AFTER: Duration = Duration::from_secs(90);
+
+/// How long ago the health file was last written, or `None` when it cannot be
+/// read at all. §5 requires every reader to tolerate a missing or stale file,
+/// so this never fails loudly.
+pub fn age_of(path: &Path) -> Option<Duration> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let updated = DateTime::parse_from_rfc3339(value.get("updated_at")?.as_str()?).ok()?;
+    let age = Utc::now().signed_duration_since(updated.with_timezone(&Utc));
+    // A timestamp in the future (clock skew) reads as "just now", not as an
+    // error.
+    Some(age.to_std().unwrap_or_default())
+}
+
 /// One camera, as the outside world sees it.
 #[derive(Debug, Clone, Serialize)]
 pub struct CameraEntry {
@@ -399,6 +418,49 @@ mod tests {
         let err = write_atomic(&target, b"{}").unwrap_err();
         assert!(!err.to_string().is_empty());
         assert!(!tmp_path(&target).exists(), "the temp file is cleaned up");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §5: readers must tolerate a missing or unparseable file rather than
+    /// treat it as fatal.
+    #[test]
+    fn a_health_file_that_is_missing_or_unreadable_has_no_age() {
+        assert_eq!(age_of(Path::new("definitely-not-there.json")), None);
+
+        let dir = std::env::temp_dir().join(format!("item-ingest-age-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("health.json");
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(age_of(&path), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_age_of_a_snapshot_tells_fresh_from_stale() {
+        let dir = std::env::temp_dir().join(format!("item-ingest-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("health.json");
+        let registry = HealthRegistry::new();
+        let mut writer = HealthWriter::new(&path, "yolo", Vec::new());
+        writer.write(&registry).unwrap();
+
+        let age = age_of(&path).expect("a written file has an age");
+        assert!(
+            age < STALE_AFTER,
+            "a just-written file is not stale: {age:?}"
+        );
+
+        let stale = serde_json::json!({
+            "updated_at": (Utc::now() - ChronoDuration::seconds(3600)).to_rfc3339(),
+        });
+        std::fs::write(&path, stale.to_string()).unwrap();
+        assert!(
+            age_of(&path).unwrap() > STALE_AFTER,
+            "an hour-old snapshot is what the liveness rule rejects"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

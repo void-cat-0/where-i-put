@@ -11,11 +11,13 @@ pub mod annotate;
 pub mod config;
 pub mod daemon;
 pub mod detector;
+pub mod events;
 pub mod frigate;
 pub mod health;
 pub mod lock;
 #[cfg(feature = "rtsp")]
 pub mod preview;
+pub mod retention;
 pub mod runner;
 pub mod runtime;
 pub mod source;
@@ -39,12 +41,40 @@ pub enum IngestError {
 
 pub type Result<T> = std::result::Result<T, IngestError>;
 
+/// What one surviving detection did to the store: the row it landed on, its
+/// zone/label (the store's dedup identity), whether the row was opened by this
+/// sighting, and the row's hit count after the merge.
+///
+/// This is what the event timeline needs and what used to be thrown away: the
+/// `(id, is_new)` pair existed only to name the snapshot file, and callers saw
+/// a bare count. `hits` is reported as of this sighting, so a later
+/// disappearance can say how often the object was seen before it went
+/// (docs/resident-ingest.md §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recorded {
+    pub obs_id: i64,
+    pub zone: String,
+    pub label: String,
+    pub is_new: bool,
+    pub hits: i64,
+}
+
+impl Recorded {
+    /// The `(camera_id, zone, label)` dedup identity this sighting belongs to.
+    pub fn key(&self) -> (&str, &str) {
+        (&self.zone, &self.label)
+    }
+}
+
 /// Persist one frame's detections: NMS them, map centers to zones, record.
 /// When `frame_rgb` + `snapshots_dir` are provided and a sighting opens a NEW
 /// observation, the frame is annotated (all surviving boxes in label colors,
 /// zone rects dashed) and JPEG-encoded to `{dir}/{obs_id}.jpg` -- one
 /// representative image per observation, written once. Boxes live in the
 /// pixels only; the database stays detection-free.
+///
+/// Returns one [`Recorded`] per surviving detection, in NMS order -- the count
+/// is `len()`, and the identities are what the event log is built from.
 pub fn ingest_detections(
     store: &Store,
     meta: &FrameMeta,
@@ -52,7 +82,7 @@ pub fn ingest_detections(
     nms_iou_threshold: f32,
     min_confidence: f32,
     frame_rgb: Option<(&[u8], &std::path::Path)>,
-) -> Result<usize> {
+) -> Result<Vec<Recorded>> {
     let owned: Vec<Detection> = dets
         .iter()
         .filter(|d| d.confidence >= min_confidence)
@@ -67,11 +97,11 @@ pub fn ingest_detections(
         None => Vec::new(),
     };
 
-    let mut recorded = 0;
+    let mut recorded = Vec::with_capacity(keep.len());
     for (hi, idx) in keep.into_iter().enumerate() {
         let det = &owned[idx];
         let zone = store.zone_for_point(&meta.camera_id, det.center())?;
-        let (id, is_new) = store.record_sighting(
+        let (id, is_new, hits) = store.record_sighting(
             &meta.camera_id,
             &zone,
             &det.label,
@@ -93,9 +123,15 @@ pub fn ingest_detections(
                 }
             }
         }
-        recorded += 1;
+        recorded.push(Recorded {
+            obs_id: id,
+            zone,
+            label: det.label.clone(),
+            is_new,
+            hits,
+        });
     }
-    tracing::debug!(camera = %meta.camera_id, recorded, "frame ingested");
+    tracing::debug!(camera = %meta.camera_id, recorded = recorded.len(), "frame ingested");
     Ok(recorded)
 }
 
@@ -168,7 +204,18 @@ mod tests {
         let recorded =
             ingest_detections(&store, &meta, &dets, 0.45, 0.3, Some((&rgb, dir.as_path())))
                 .unwrap();
-        assert_eq!(recorded, 1);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0],
+            Recorded {
+                obs_id: 1,
+                zone: "desk".into(),
+                label: "bottle".into(),
+                is_new: true,
+                hits: 1,
+            },
+            "the row identity the caller used to lose"
+        );
 
         let obs = store.recent(None, 10).unwrap();
         assert_eq!(obs.len(), 1);

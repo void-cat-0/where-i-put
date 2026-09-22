@@ -23,6 +23,9 @@
 //! health_file = "data/health.json"
 //! rescan_config_secs = 0          # 0 = no hot reload
 //! checkpoint_secs = 300
+//! retention_days = 90             # 0 = keep observations forever
+//! sweep_secs = 3600               # 0 = prune only on demand (--maintenance)
+//! reconcile_secs = 604800         # 0 = never scan for orphan snapshot files
 //!
 //! [webhook]
 //! enabled = true
@@ -54,6 +57,9 @@ pub mod defaults {
     pub const DB: &str = "data/items.db";
     pub const SNAPSHOTS_DIR: &str = "data/snapshots";
     pub const HEALTH_FILE: &str = "data/health.json";
+    /// The appeared/disappeared timeline (§6). An empty value in config.toml
+    /// turns it off; see [`RuntimeConfig::events_path`].
+    pub const EVENTS_FILE: &str = "data/events.jsonl";
     pub const LISTEN: &str = "127.0.0.1:8477";
     pub const CAMERA_ID: &str = "rtsp-0";
     pub const DETECTOR: &str = "yolo";
@@ -63,6 +69,17 @@ pub mod defaults {
     pub const VLM_TIMEOUT_SECS: u64 = 60;
     pub const VLM_COORDS: &str = "norm1000";
     pub const CHECKPOINT_SECS: u64 = 300;
+    /// How long an observation is kept after its `last_seen`. **Read the hard
+    /// constraint in `item-ingest::retention` before lowering this**: the v2
+    /// rule engine (README Roadmap step 3) infers containment from
+    /// disappearances, and the evidence it needs is exactly what this window
+    /// deletes -- no later run can recreate it (docs/resident-ingest.md §7).
+    pub const RETENTION_DAYS: u64 = 90;
+    /// How often expired observations are pruned.
+    pub const SWEEP_SECS: u64 = 3600;
+    /// How often the snapshots directory is scanned for files whose row is
+    /// gone. Weekly: it is a repair pass, not the primary cleanup.
+    pub const RECONCILE_SECS: u64 = 7 * 24 * 3600;
     /// Grounding is one HTTP round trip per detection against a local LLM, so
     /// the VLM default is far below the local-detector one.
     pub const DETECT_FPS_VLM: f64 = 0.2;
@@ -84,9 +101,19 @@ pub struct DaemonConfig {
     pub db: Option<String>,
     pub snapshots_dir: Option<String>,
     pub health_file: Option<String>,
+    /// Where the appeared/disappeared timeline is appended; `""` = produce no
+    /// events (docs/resident-ingest.md §6).
+    pub events_file: Option<String>,
     /// 0 = never reload config.toml while running (phase 2 feature).
     pub rescan_config_secs: Option<u64>,
     pub checkpoint_secs: Option<u64>,
+    /// Days an observation is kept after its `last_seen`; 0 = keep forever.
+    pub retention_days: Option<u64>,
+    /// How often expired observations are pruned; 0 = only on demand
+    /// (`item-ingest --maintenance`).
+    pub sweep_secs: Option<u64>,
+    /// How often to scan the snapshots directory for orphan files; 0 = never.
+    pub reconcile_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -184,6 +211,7 @@ impl Config {
                 detector: settings.detector_spec_for(Some(cam)),
                 detect_fps: settings.detect_fps_for(Some(cam)),
                 snapshot_dir: PathBuf::from(&settings.snapshots_dir),
+                events_path: settings.events_path(),
                 // The daemon runs until it is asked to stop.
                 max_frames: 0,
                 enabled: true,
@@ -236,9 +264,17 @@ pub struct RuntimeConfig {
     pub db: String,
     pub snapshots_dir: String,
     pub health_file: String,
+    /// The appeared/disappeared timeline path; empty string = off (§6).
+    pub events_file: String,
     /// 0 = do not reload config.toml at runtime (phase 2).
     pub rescan_config_secs: u64,
     pub checkpoint_secs: u64,
+    /// 0 = keep observations forever (retention off).
+    pub retention_days: u64,
+    /// How often to prune; 0 = only on demand.
+    pub sweep_secs: u64,
+    /// How often to look for orphan snapshot files; 0 = never.
+    pub reconcile_secs: u64,
     pub webhook_enabled: bool,
     pub listen: String,
     /// `None` = the preview endpoint stays off.
@@ -283,10 +319,22 @@ impl RuntimeConfig {
             health_file: daemon
                 .and_then(|d| d.health_file.clone())
                 .unwrap_or_else(|| defaults::HEALTH_FILE.to_string()),
+            events_file: daemon
+                .and_then(|d| d.events_file.clone())
+                .unwrap_or_else(|| defaults::EVENTS_FILE.to_string()),
             rescan_config_secs: daemon.and_then(|d| d.rescan_config_secs).unwrap_or(0),
             checkpoint_secs: daemon
                 .and_then(|d| d.checkpoint_secs)
                 .unwrap_or(defaults::CHECKPOINT_SECS),
+            retention_days: daemon
+                .and_then(|d| d.retention_days)
+                .unwrap_or(defaults::RETENTION_DAYS),
+            sweep_secs: daemon
+                .and_then(|d| d.sweep_secs)
+                .unwrap_or(defaults::SWEEP_SECS),
+            reconcile_secs: daemon
+                .and_then(|d| d.reconcile_secs)
+                .unwrap_or(defaults::RECONCILE_SECS),
             webhook_enabled: webhook.and_then(|w| w.enabled).unwrap_or(true),
             listen: take(
                 &cli.listen,
@@ -413,7 +461,19 @@ impl RuntimeConfig {
         self.db = absolute(base, &self.db);
         self.snapshots_dir = absolute(base, &self.snapshots_dir);
         self.health_file = absolute(base, &self.health_file);
+        // An empty events_file means "off" and must stay empty: absolutizing it
+        // would turn the off switch into the config directory.
+        if !self.events_file.is_empty() {
+            self.events_file = absolute(base, &self.events_file);
+        }
         self.model = absolute(base, &self.model);
+    }
+
+    /// Where the event timeline goes for a camera, or `None` when events are
+    /// off (`events_file = ""`). Same "empty string means off" rule as
+    /// `preview_url`.
+    pub fn events_path(&self) -> Option<PathBuf> {
+        (!self.events_file.is_empty()).then(|| PathBuf::from(&self.events_file))
     }
 
     /// The single-instance lock lives next to the database: one writer per
@@ -423,6 +483,13 @@ impl RuntimeConfig {
             Some(dir) if !dir.as_os_str().is_empty() => dir.join("ingest.lock"),
             _ => PathBuf::from("ingest.lock"),
         }
+    }
+
+    /// The retention window, or `None` when retention is off
+    /// (`retention_days = 0`).
+    pub fn retention_window(&self) -> Option<Duration> {
+        (self.retention_days > 0)
+            .then(|| Duration::from_secs(self.retention_days.saturating_mul(24 * 3600)))
     }
 }
 
@@ -512,6 +579,61 @@ desk = [100.0, 100.0, 700.0, 400.0]
         assert!(cfg.webhook_enabled);
         assert_eq!(cfg.preview_url, None);
         assert_eq!(cfg.vlm_base_url, None);
+        assert_eq!(cfg.checkpoint_secs, 300);
+        assert_eq!(cfg.retention_days, 90);
+        assert_eq!(
+            cfg.retention_window(),
+            Some(Duration::from_secs(90 * 24 * 3600)),
+            "the default window is the one the roadmap needs (§7)"
+        );
+        assert_eq!(cfg.sweep_secs, 3600);
+        assert_eq!(cfg.reconcile_secs, 7 * 24 * 3600);
+        assert_eq!(cfg.events_file, "data/events.jsonl");
+        assert_eq!(
+            cfg.events_path(),
+            Some(PathBuf::from("data/events.jsonl")),
+            "the timeline is on by default (§6)"
+        );
+    }
+
+    #[test]
+    fn an_empty_events_file_turns_the_timeline_off() {
+        let file = parse(
+            r#"
+[daemon]
+events_file = ""
+"#,
+        );
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        assert_eq!(
+            cfg.events_path(),
+            None,
+            "empty string means off, like preview_url"
+        );
+
+        let mut cfg = cfg;
+        cfg.absolutize(Path::new("/base"));
+        assert_eq!(
+            cfg.events_file, "",
+            "absolutizing must not turn the off switch into a path"
+        );
+    }
+
+    #[test]
+    fn a_relative_events_file_is_resolved_against_the_config_directory() {
+        let file = parse(
+            r#"
+[daemon]
+events_file = "logs/events.jsonl"
+"#,
+        );
+        let mut cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        cfg.absolutize(Path::new("/base"));
+        assert!(
+            cfg.events_path().unwrap().is_absolute(),
+            "a service manager picks the cwd, so this must not stay relative"
+        );
+        assert!(cfg.events_file.ends_with("events.jsonl"));
     }
 
     #[test]
@@ -523,6 +645,9 @@ db = "from-file.db"
 snapshots_dir = "from-file-snaps"
 health_file = "from-file-health.json"
 checkpoint_secs = 42
+retention_days = 30
+sweep_secs = 60
+reconcile_secs = 120
 
 [webhook]
 listen = "0.0.0.0:9000"
@@ -540,12 +665,35 @@ targets = "keys,wallet"
         assert_eq!(cfg.snapshots_dir, "from-file-snaps");
         assert_eq!(cfg.health_file, "from-file-health.json");
         assert_eq!(cfg.checkpoint_secs, 42);
+        assert_eq!(cfg.retention_days, 30);
+        assert_eq!(
+            cfg.retention_window(),
+            Some(Duration::from_secs(30 * 24 * 3600))
+        );
+        assert_eq!(cfg.sweep_secs, 60);
+        assert_eq!(cfg.reconcile_secs, 120);
         assert_eq!(cfg.listen, "0.0.0.0:9000");
         assert!(!cfg.webhook_enabled);
         assert_eq!(
             cfg.detector, "yolo",
             "no --camera-id: no camera row matches"
         );
+    }
+
+    #[test]
+    fn zero_retention_days_means_keep_everything() {
+        let file = parse(
+            r#"
+[daemon]
+retention_days = 0
+sweep_secs = 0
+reconcile_secs = 0
+"#,
+        );
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        assert_eq!(cfg.retention_window(), None);
+        assert_eq!(cfg.sweep_secs, 0, "0 is a value, not 'unset'");
+        assert_eq!(cfg.reconcile_secs, 0);
     }
 
     #[test]

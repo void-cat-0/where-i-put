@@ -87,7 +87,10 @@ pub async fn webhook(
         snapshot.as_deref(),
         item_core::store::DEFAULT_DEDUP_WINDOW,
     ) {
-        // webhooks carry no pixels; the (id, is_new) tuple is not used here
+        // Webhooks carry no pixels, and this path produces no events: Frigate
+        // sends discrete events with no continuous frames, so a disappearance
+        // can never be observed here (§6/§9). The tuple is intentionally
+        // dropped.
         Ok(_) => axum::http::StatusCode::OK,
         Err(e) => {
             tracing::error!(error = %e, "failed to persist frigate event");

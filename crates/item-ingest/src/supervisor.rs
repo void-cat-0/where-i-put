@@ -46,7 +46,7 @@ impl Backoff {
     }
 
     /// The delay to apply now, then double it for the next attempt.
-    pub fn next(&mut self) -> Duration {
+    pub fn next_delay(&mut self) -> Duration {
         let wait = self.current;
         self.current = (self.current * 2).min(Self::MAX);
         wait
@@ -276,7 +276,7 @@ fn drive(
         if !runner.is_open() {
             tracing::info!(source = %source_desc, "opening {kind} source");
             if let Err(e) = runner.open() {
-                let delay = backoff.next();
+                let delay = backoff.next_delay();
                 tracing::warn!(error = %e, retry_in_s = delay.as_secs(), "connect failed");
                 publish!();
                 if sleep_backoff(&stop, delay) {
@@ -303,7 +303,7 @@ fn drive(
                 break;
             }
             Ok(StepOutcome::Lost(reason)) => {
-                let delay = backoff.next();
+                let delay = backoff.next_delay();
                 match &reason {
                     Some(SourceError::Eof) => {
                         tracing::info!(retry_in_s = delay.as_secs(), "stream ended, reconnecting")
@@ -325,7 +325,7 @@ fn drive(
             Ok(StepOutcome::DetectorFailed) => {
                 // The runner already warned about the detector itself; this is
                 // only the pause before trying the next frame.
-                let delay = backoff.next();
+                let delay = backoff.next_delay();
                 tracing::warn!(
                     retry_in_s = delay.as_secs(),
                     "detector unavailable; backing off before the next frame"
@@ -348,6 +348,13 @@ fn drive(
             }
         }
     }
+
+    // Shutdown checkpoint (§3/§6): a disappearance is only noticed at the
+    // next scan, and this camera is about to have no next scan. Every still-open
+    // key is reported as gone now, or the last real disappearance of the run
+    // would be lost. Also runs for a camera that failed, since its keys are just
+    // as abandoned.
+    runner.flush_events(chrono::Utc::now());
 
     let final_health = runner.health();
     outcome.frames = final_health.frames;
@@ -393,6 +400,7 @@ mod tests {
             detector: DetectorSpec::Null,
             detect_fps: 1.0,
             snapshot_dir: std::path::PathBuf::from("unused"),
+            events_path: None,
             max_frames,
             enabled: true,
         }
@@ -451,6 +459,57 @@ mod tests {
         assert!(idle().run(&store, vec![task]).is_empty());
     }
 
+    /// A camera thread that stops on request leaves a well-formed event log and
+    /// a released lock, whatever it managed to observe.
+    ///
+    /// The shutdown *flush* itself (every open key reported as gone) is proven
+    /// at the runner level, where a detector can be injected to produce real
+    /// sightings -- `drive` builds its detector from the task's spec, and the
+    /// featureless build's only spec is `Null`, which reports nothing. What this
+    /// pins down is the part the supervisor owns: stopping a camera must leave
+    /// whole lines on disk and no half-written file, even when it observed
+    /// nothing.
+    #[test]
+    fn a_stopped_camera_leaves_a_well_formed_event_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "item-ingest-supervisor-events-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("events.jsonl");
+
+        let mut task = mock_task("cam", u32::MAX, 0);
+        task.events_path = Some(log_path.clone());
+
+        let store = store();
+        let registry = HealthRegistry::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut supervisor = Supervisor::new(Arc::clone(&stop)).with_health(registry);
+
+        // Start, let it run a moment, then stop it the way the daemon does.
+        supervisor.start(&store, vec![task]);
+        std::thread::sleep(Duration::from_millis(150));
+        supervisor.request_stop();
+        let outcomes = supervisor.join(Some(Duration::from_secs(5)));
+        assert_eq!(outcomes.len(), 1);
+
+        // The start marker is written at open; every line must parse.
+        let text = std::fs::read_to_string(&log_path).expect("the log was created");
+        assert!(
+            !text.is_empty(),
+            "opening the log writes the process-start marker"
+        );
+        for line in text.lines() {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "a partial line would break every consumer: {line}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_running_camera_publishes_health_while_it_works() {
         let store = store();
@@ -489,16 +548,20 @@ mod tests {
     #[test]
     fn backoff_doubles_to_the_ceiling_and_resets() {
         let mut backoff = Backoff::new();
-        assert_eq!(backoff.next(), Duration::from_secs(2));
-        assert_eq!(backoff.next(), Duration::from_secs(4));
-        assert_eq!(backoff.next(), Duration::from_secs(8));
-        assert_eq!(backoff.next(), Duration::from_secs(16));
-        assert_eq!(backoff.next(), Duration::from_secs(32));
-        assert_eq!(backoff.next(), Duration::from_secs(60), "capped");
-        assert_eq!(backoff.next(), Duration::from_secs(60), "stays capped");
+        assert_eq!(backoff.next_delay(), Duration::from_secs(2));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(4));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(8));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(16));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(32));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(60), "capped");
+        assert_eq!(
+            backoff.next_delay(),
+            Duration::from_secs(60),
+            "stays capped"
+        );
 
         // A camera that comes back must not inherit the old penalty.
         backoff.reset();
-        assert_eq!(backoff.next(), Duration::from_secs(2));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(2));
     }
 }

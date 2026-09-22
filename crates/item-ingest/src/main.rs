@@ -12,12 +12,6 @@ use clap::Parser;
 
 use item_core::store::Store;
 use item_ingest::config::CliOverrides;
-#[cfg(any(
-    feature = "yolo",
-    feature = "vlm",
-    feature = "rtsp",
-    feature = "camera"
-))]
 use item_ingest::config::RuntimeConfig;
 use item_ingest::detector::{Detector, NullDetector};
 #[cfg(any(
@@ -48,6 +42,18 @@ struct Args {
     /// --config, until a stop signal. Requires --config.
     #[arg(long)]
     daemon: bool,
+
+    /// Offline maintenance, then exit: prune observations past the retention
+    /// window (and their snapshots), delete orphan snapshot files, checkpoint
+    /// the WAL and VACUUM. Refuses to run while a daemon holds the lock.
+    #[arg(long, conflicts_with = "daemon")]
+    maintenance: bool,
+
+    /// With --maintenance: skip the single-instance lock. Only for a lock file
+    /// left behind by a killed daemon -- never while one is actually running,
+    /// since it is writing the snapshots this pass deletes.
+    #[arg(long)]
+    force: bool,
 
     /// Address for the Frigate webhook server (default: 127.0.0.1:8477).
     #[arg(long)]
@@ -209,6 +215,14 @@ fn main() -> anyhow::Result<()> {
         // cwd a service manager happens to pick (§3).
         settings.absolutize(&config_dir(&args));
         return item_ingest::daemon::run(settings, file);
+    }
+
+    // Same rule for the offline pass: it must look at the same database and
+    // snapshot directory the daemon does.
+    if args.maintenance {
+        let mut settings = settings;
+        settings.absolutize(&config_dir(&args));
+        return maintenance_pass(settings, args.force);
     }
 
     if let Some(dir) = Path::new(&settings.db).parent() {
@@ -412,7 +426,7 @@ fn demo_pass(store: &Store) -> anyhow::Result<()> {
         };
         let dets = detector.detect(&frame.rgb, frame.meta.width, frame.meta.height)?;
         let n = item_ingest::ingest_detections(store, &frame.meta, &dets, 0.5, 0.25, None)?;
-        tracing::info!(recorded = n, "demo frame processed");
+        tracing::info!(recorded = n.len(), "demo frame processed");
     }
     // Prove the zone mapping and dedup round-trip.
     store.upsert_region("demo-cam", "desk", [100.0, 100.0, 300.0, 300.0])?;
@@ -430,6 +444,104 @@ fn demo_pass(store: &Store) -> anyhow::Result<()> {
         obs.first().map(|o| (&o.zone, &o.label))
     );
     Ok(())
+}
+
+/// `--maintenance`: the offline half of §7 -- the work that must not run inside
+/// the daemon (VACUUM holds an exclusive lock for as long as it takes to
+/// rewrite the file) plus the cleanup an operator wants on demand. The report
+/// goes to stdout; logs stay on stderr, like every other mode.
+fn maintenance_pass(settings: RuntimeConfig, force: bool) -> anyhow::Result<()> {
+    use item_ingest::SharedStore;
+    use item_ingest::retention;
+
+    if force {
+        warn_about_force(&settings);
+    }
+    // The daemon owns the database while it runs, and the lock file is what
+    // says so. A stale file left by a killed daemon is the case --force is for.
+    let _lock = if force {
+        None
+    } else {
+        Some(
+            item_ingest::lock::SingleInstance::acquire(&settings.lock_path()).context(
+                "a daemon is running; stop it first, or pass --force if it is really gone",
+            )?,
+        )
+    };
+
+    let store: SharedStore = Arc::new(Mutex::new(
+        Store::open(&settings.db).context("opening sqlite store")?,
+    ));
+    let snapshots_dir = Path::new(&settings.snapshots_dir).to_path_buf();
+    println!("database:  {}", settings.db);
+    println!("snapshots: {}", snapshots_dir.display());
+    let before = store
+        .lock()
+        .expect("store mutex poisoned")
+        .count_observations()?;
+
+    match settings.retention_window() {
+        Some(window) => {
+            let report = retention::prune(&store, &snapshots_dir, window, chrono::Utc::now())?;
+            println!(
+                "pruned:    {} observation(s) and {} snapshot(s) ({} KiB), {} kept \
+                 [window {} days]",
+                report.rows_deleted,
+                report.files_deleted,
+                report.bytes_freed / 1024,
+                report.files_kept,
+                settings.retention_days
+            );
+        }
+        None => println!("pruned:    nothing -- retention is off (retention_days = 0)"),
+    }
+
+    let orphans = retention::reconcile(&store, &snapshots_dir)?;
+    println!(
+        "orphans:   {} file(s) ({} KiB), {} kept",
+        orphans.files_deleted,
+        orphans.bytes_freed / 1024,
+        orphans.files_kept
+    );
+
+    let after = store
+        .lock()
+        .expect("store mutex poisoned")
+        .count_observations()?;
+    {
+        let store = store.lock().expect("store mutex poisoned");
+        store.checkpoint().context("wal checkpoint")?;
+        store.vacuum().context("vacuum")?;
+    }
+    println!("rows:      {before} -> {after}");
+    println!("wal:       checkpointed (truncate), database vacuumed");
+    Ok(())
+}
+
+/// `--force` deletes files a live daemon may be writing. The health file is the
+/// only portable liveness signal (§5), so use it to say which of the two
+/// situations the operator is actually in.
+fn warn_about_force(settings: &RuntimeConfig) {
+    use item_ingest::health::{STALE_AFTER, age_of};
+
+    match age_of(Path::new(&settings.health_file)) {
+        Some(age) if age < STALE_AFTER => tracing::warn!(
+            health = %settings.health_file,
+            age_s = age.as_secs(),
+            "--force: the health file was updated moments ago, so a daemon is probably still \
+             running; deleting snapshots it is writing is unsafe"
+        ),
+        Some(age) => tracing::warn!(
+            health = %settings.health_file,
+            age_s = age.as_secs(),
+            "--force: the health file is stale, so the lock is most likely left over from a \
+             killed daemon"
+        ),
+        None => tracing::warn!(
+            health = %settings.health_file,
+            "--force: no readable health file to check; make sure no daemon is running"
+        ),
+    }
 }
 
 /// Run the selected detector on a single image file (--detect):
@@ -521,6 +633,7 @@ fn camera_task(
         detector: detector_spec(settings)?,
         detect_fps: settings.detect_fps(),
         snapshot_dir: Path::new(&settings.snapshots_dir).to_path_buf(),
+        events_path: settings.events_path(),
         max_frames,
         enabled: true,
     })
