@@ -1,8 +1,15 @@
 //! VLM sidecar client: any OpenAI-compatible /v1/chat/completions endpoint
-//! (llama.cpp server, Ollama with a vision model, or a cloud API). The Rust
-//! core never embeds a VLM — swap backends by changing base_url/model.
+//! (llama.cpp server, Ollama, or a cloud API). The Rust core never embeds a
+//! VLM — swap backends by changing base_url/model.
+
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+/// Per-request budget. Without one a stalled sidecar holds the caller (a CLI
+/// invocation, or an axum request in item-web) open forever. Same 60s as the
+/// ingest side's `defaults::VLM_TIMEOUT_SECS`.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
@@ -28,7 +35,10 @@ struct Choice {
 
 #[derive(Debug, Deserialize)]
 struct ReplyMessage {
-    content: String,
+    /// Servers emit `"content": null` for a refusal or a truncated reply;
+    /// that is an empty answer, not a deserialization failure.
+    #[serde(default)]
+    content: Option<String>,
 }
 
 pub struct VlmClient {
@@ -43,7 +53,10 @@ impl VlmClient {
         Self {
             base_url: base_url.into(),
             model: model.into(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -76,10 +89,17 @@ impl VlmClient {
             .error_for_status()?
             .json()
             .await?;
-        resp.choices
+        let answer = resp
+            .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("vlm returned no choices"))
+            .ok_or_else(|| anyhow::anyhow!("vlm returned no choices"))?
+            .message
+            .content
+            .unwrap_or_default();
+        if answer.trim().is_empty() {
+            anyhow::bail!("vlm returned an empty answer");
+        }
+        Ok(answer)
     }
 }

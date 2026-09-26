@@ -74,6 +74,12 @@
 const $=s=>document.querySelector(s);
 const grid=$('#grid'), q=$('#q'), askq=$('#askq'), answer=$('#answer');
 
+// Every string that reaches innerHTML goes through this first. Labels come from
+// a detector or a webhook payload -- a model that answers with
+// `<img src=x onerror=...>` must not get to run script in the operator's
+// browser, where the API is same-origin.
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
 function relTime(iso){
   const d=(Date.now()-new Date(iso))/1000;
   if(d<60)return 'just now';
@@ -86,14 +92,15 @@ function card(o){
   const el=document.createElement('article');
   el.className='card';
   const url='/api/observation/'+o.id+'/snapshot';
+  const label=esc(o.label), zone=esc(o.zone), camera=esc(o.camera);
   const shot=o.has_snapshot
-    ? '<div class="shot" data-full="'+url+'" data-cap="'+o.label+' @ '+o.zone+'"><img loading="lazy" src="'+url+'" alt="'+o.label+' in '+o.zone+'"></div>'
+    ? '<div class="shot" data-full="'+url+'" data-cap="'+label+' @ '+zone+'"><img loading="lazy" src="'+url+'" alt="'+label+' in '+zone+'"></div>'
     : '<div class="shot">no snapshot</div>';
   el.innerHTML=shot+'<div class="body">'+
-    '<div class="label">'+o.label+'</div>'+
-    '<div class="row"><span class="chip">'+o.zone+'</span>'+
-      '<span class="chip">'+o.camera+'</span>'+
-      '<span class="hits">×'+o.hits+'</span></div>'+
+    '<div class="label">'+label+'</div>'+
+    '<div class="row"><span class="chip">'+zone+'</span>'+
+      '<span class="chip">'+camera+'</span>'+
+      '<span class="hits">×'+Number(o.hits)+'</span></div>'+
     '<div class="meta">last seen '+relTime(o.last_seen)+
       ' · first '+relTime(o.first_seen)+'</div>'+
   '</div>';
@@ -110,7 +117,7 @@ async function refresh(){
   else{
     empty.style.display='block';
     empty.innerHTML=q.value.trim()
-      ? 'No objects match “'+q.value.trim().replace(/</g,'&lt;')+'”.'
+      ? 'No objects match “'+esc(q.value.trim())+'”.'
       : 'No observations yet — run the ingest loop:<br><code>cargo run --features "rtsp,yolo" -p item-ingest -- --rtsp &lt;url&gt; --camera-id &lt;id&gt; --config config.toml</code>';
   }
   $('#count').textContent=obs.length+' observation'+(obs.length===1?'':'s');

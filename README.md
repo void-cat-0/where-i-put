@@ -347,9 +347,12 @@ in/under the box, now on the shelf"), never as fact. Building blocks, in order:
    and the covering event are temporal facts only continuous observation
    produces — sporadic manual runs never see them. Design draft (process model,
    config, health file, retention, event observation):
-   [docs/resident-ingest.md](docs/resident-ingest.md). **P0–P3 landed** (process
-   split, daemon skeleton, health/heartbeat/backoff, retention + `--maintenance`);
-   P4 (event observation) and P5 (service units) are still open.
+   [docs/resident-ingest.md](docs/resident-ingest.md). **P0–P5 all landed**
+   (process split, daemon skeleton, health/heartbeat/backoff, retention +
+   `--maintenance`, the appeared/disappeared timeline, the three service
+   templates), each with a real-hardware verification pass; the known gaps are
+   listed in §9 of that document (chiefly: Linux/macOS service installs are
+   template-level only).
 2. **Data model v2**: persist per-observation bboxes (the DB currently stores
    zone + a burned-in snapshot only, no coordinates) and an events table
    (appeared / disappeared / covered / moved).

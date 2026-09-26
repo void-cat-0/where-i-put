@@ -7,6 +7,42 @@ pub mod vlm;
 
 use item_core::Observation;
 
+/// The one content word a plain-language question is about
+/// (`"where are my keys?"` -> `"keys"`).
+///
+/// Both frontends go through this, so the CLI and the web ask bar pick the
+/// same keyword for the same question. The rule:
+///
+/// 1. split on whitespace and keep only alphanumerics from each word --
+///    otherwise `"cup?"` is searched for literally, punctuation included, and
+///    matches nothing;
+/// 2. skip words shorter than two characters and the interrogatives/verbs that
+///    appear in every question;
+/// 3. fall back to the whole question when nothing is left, which the store
+///    then matches as a literal substring.
+///
+/// Lower-casing is ASCII-only, the same folding SQLite's `LIKE` does.
+pub fn keyword_of(question: &str) -> String {
+    const STOPWORDS: &[&str] = &[
+        "where", "wheres", "what", "whats", "when", "which", "who", "is", "are", "was", "were",
+        "did", "do", "does", "the", "my", "me", "you", "your", "it", "its", "see", "saw", "put",
+        "left", "tell", "find", "show", "at", "in", "on", "of", "to", "for", "there",
+    ];
+    question
+        .split_whitespace()
+        .map(normalize_word)
+        .find(|word| word.chars().count() >= 2 && !STOPWORDS.contains(&word.as_str()))
+        .unwrap_or_else(|| question.trim().to_lowercase())
+}
+
+/// Lower-cased alphanumerics of one word: `"keys?"` -> `"keys"`.
+fn normalize_word(word: &str) -> String {
+    word.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
 /// Build the sighting-log prompt fed to the VLM.
 pub fn build_prompt(query: &str, obs: &[Observation]) -> String {
     use std::fmt::Write;
@@ -55,5 +91,29 @@ mod tests {
         assert!(p.contains("keys"));
         assert!(p.contains("sofa"));
         assert!(p.contains("18:30"));
+    }
+
+    /// The placeholder text of the web UI's ask bar, and the shape the CLI
+    /// takes: punctuation must not travel into the search string.
+    #[test]
+    fn a_question_reduces_to_its_content_word() {
+        assert_eq!(keyword_of("where is the cup?"), "cup");
+        assert_eq!(keyword_of("Where are my keys!"), "keys");
+        assert_eq!(keyword_of("where did I put the remote"), "remote");
+        assert_eq!(keyword_of("  scissors  "), "scissors");
+        assert_eq!(
+            keyword_of("what's on the sofa?"),
+            "sofa",
+            "\"what's\" folds to the stopword \"whats\""
+        );
+        // A label with real punctuation keeps its alphanumerics, and the store
+        // matches them literally.
+        assert_eq!(keyword_of("50% tint"), "50");
+    }
+
+    #[test]
+    fn a_question_without_a_content_word_falls_back_to_all_of_it() {
+        assert_eq!(keyword_of("where is it?"), "where is it?");
+        assert_eq!(keyword_of(""), "");
     }
 }

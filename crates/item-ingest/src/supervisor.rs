@@ -7,12 +7,15 @@
 //! genuinely fatal condition (e.g. a model that cannot be loaded) marks that
 //! camera `failed` and stops retrying instead of spamming the log.
 //!
-//! Scope note (P1): the backoff is still the historical fixed 2s -- exponential
-//! backoff with a 60s ceiling is P2, and the event checkpoints that hook into
-//! the same `step()` boundary are P4 (docs/resident-ingest.md §10). The store
-//! lock is taken coarsely, once per `step()`; moving annotation + JPEG encoding
-//! out of it (§3) needs `ingest_detections` to take the shared handle, which is
-//! still open work.
+//! The backoff is exponential from 2s to a 60s ceiling and resets on a real
+//! frame ([`Backoff`], §10 P2). The event timeline's shutdown flush lives at the
+//! end of [`drive`] (§3/§6, P4), because a disappearance is only ever noticed by
+//! the *next* scan and the camera thread is about to have none.
+//!
+//! Known open item (§3): the store lock is taken coarsely, once per `step()`, so
+//! annotation + JPEG encoding of a new observation happen under it. Moving that
+//! work out needs `ingest_detections` to take the shared handle rather than a
+//! `&Store`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

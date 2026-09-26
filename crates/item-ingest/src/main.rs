@@ -510,11 +510,17 @@ fn maintenance_pass(settings: RuntimeConfig, force: bool) -> anyhow::Result<()> 
         .count_observations()?;
     {
         let store = store.lock().expect("store mutex poisoned");
-        store.checkpoint().context("wal checkpoint")?;
+        // A reader holding the database (item-web, a `tail`ed copy) blocks the
+        // truncation. That is worth reporting and not worth failing the pass
+        // over: the rows are already pruned and the data is safe.
+        match store.checkpoint() {
+            Ok(()) => println!("wal:       checkpointed (truncate)"),
+            Err(e) => println!("wal:       not truncated ({e}); retry with no readers connected"),
+        }
         store.vacuum().context("vacuum")?;
     }
     println!("rows:      {before} -> {after}");
-    println!("wal:       checkpointed (truncate), database vacuumed");
+    println!("database:  vacuumed");
     Ok(())
 }
 

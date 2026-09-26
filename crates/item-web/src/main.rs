@@ -39,11 +39,26 @@ struct App {
     /// Base directory the daemon wrote snapshots relative to (paths in the
     /// db may be relative); usually the ingest process's cwd == our cwd.
     root: PathBuf,
+    /// The sidecar client, built once from the environment (`None` when
+    /// ITEM_VLM_BASE_URL/MODEL are unset). Held rather than rebuilt per
+    /// request, so every ask reuses one connection pool.
+    vlm: std::sync::OnceLock<Option<item_query::vlm::VlmClient>>,
 }
 
 impl App {
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
         self.store.lock().expect("store mutex")
+    }
+
+    /// The VLM client, if the environment describes one.
+    fn vlm(&self) -> Option<&item_query::vlm::VlmClient> {
+        self.vlm
+            .get_or_init(|| {
+                let base = std::env::var("ITEM_VLM_BASE_URL").ok()?;
+                let model = std::env::var("ITEM_VLM_MODEL").ok()?;
+                Some(item_query::vlm::VlmClient::new(base, model))
+            })
+            .as_ref()
     }
 
     /// Resolve a db-stored snapshot path to an on-disk candidate: absolute
@@ -157,49 +172,29 @@ struct AskParams {
 /// NL answering: same path as item-query's CLI (substring keyword -> log ->
 /// optional VLM formatting). Returns {answer} or {fallback log} shapes.
 async fn ask(State(app): State<State_>, Query(p): Query<AskParams>) -> Response {
-    let word =
-        p.q.split_whitespace()
-            .map(str::to_lowercase)
-            .find(|w| {
-                w.chars().filter(|c| c.is_alphabetic()).count() >= 2
-                    && !matches!(
-                        w.as_str(),
-                        "where"
-                            | "is"
-                            | "are"
-                            | "my"
-                            | "the"
-                            | "did"
-                            | "do"
-                            | "put"
-                            | "was"
-                            | "you"
-                            | "see"
-                            | "at"
-                            | "in"
-                            | "on"
-                            | "tell"
-                    )
-            })
-            .unwrap_or_else(|| p.q.to_lowercase());
+    // The same keyword rule the CLI uses, so both answer from the same rows.
+    let word = item_query::keyword_of(&p.q);
     let obs = {
         let store = app.store();
-        store
-            .recent(Some(&word), 20)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-            .unwrap_or_default()
+        match store.recent(Some(&word), 20) {
+            Ok(obs) => obs,
+            // A failed read is not "nothing matched": say so, like `list`.
+            Err(e) => {
+                tracing::warn!(error = %e, "ask: reading observations failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
     };
     let json_obs: Vec<ObsJson> = obs
         .iter()
         .map(|o| ObsJson::new(o, |s| app.resolve_snapshot(s).is_some_and(|p| p.is_file())))
         .collect();
-    match (
-        std::env::var("ITEM_VLM_BASE_URL"),
-        std::env::var("ITEM_VLM_MODEL"),
-    ) {
-        (Ok(base), Ok(model)) => {
+    // One client (and one connection pool) for the process, built on first
+    // ask; `None` means the env vars describing the sidecar are not set.
+    let client = app.vlm();
+    match client {
+        Some(client) => {
             let prompt = item_query::build_prompt(&p.q, &obs);
-            let client = item_query::vlm::VlmClient::new(base, model);
             match client.ask(&prompt).await {
                 Ok(answer) => axum::Json(serde_json::json!({ "mode": "vlm", "answer": answer }))
                     .into_response(),
@@ -209,7 +204,9 @@ async fn ask(State(app): State<State_>, Query(p): Query<AskParams>) -> Response 
                 .into_response(),
             }
         }
-        _ => axum::Json(serde_json::json!({ "mode": "log", "matched": json_obs })).into_response(),
+        None => {
+            axum::Json(serde_json::json!({ "mode": "log", "matched": json_obs })).into_response()
+        }
     }
 }
 
@@ -223,18 +220,29 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    // Read-only: the ingest daemon owns writes. If the db is missing we still
-    // start (empty UI) so first-run isn't a crash.
-    let store = Store::open_read_only(&args.db)
-        .or_else(|_| {
-            tracing::warn!(db = %args.db, "cannot open read-only; trying read-write create");
-            Store::open(&args.db)
-        })
-        .with_context(|| format!("opening {}", args.db))?;
+    // Strictly read-only: the ingest daemon owns writes, and a fallback to a
+    // read-write open would create + migrate a database, or take the write
+    // lock, exactly when the daemon is busy with it. A database that is not
+    // there yet is the one case we tolerate: serve the empty UI (first run)
+    // from an in-memory store instead of creating a file behind the daemon.
+    let store = match Store::open_read_only(&args.db) {
+        Ok(store) => store,
+        Err(_) if !std::path::Path::new(&args.db).exists() => {
+            tracing::warn!(
+                db = %args.db,
+                "no database yet; serving an empty UI (run item-ingest to fill it)"
+            );
+            Store::in_memory()?
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("opening {} read-only", args.db)));
+        }
+    };
 
     let app = Arc::new(App {
         store: Mutex::new(store),
         root: std::env::current_dir()?,
+        vlm: std::sync::OnceLock::new(),
     });
     let router = axum::Router::new()
         .route("/", get(index))

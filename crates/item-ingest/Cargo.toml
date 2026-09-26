@@ -57,16 +57,22 @@ features = ["blocking"]
 workspace = true
 optional = true
 
+# Streaming adapters for the MJPEG preview, which is the rtsp feature's
+# (`preview.rs` is the only user), so they are optional too -- declaring them
+# unconditionally would have cargo report them as unused in every build
+# without `rtsp`.
 [dependencies.tokio-stream]
 version = "0.1"
 features = ["sync"]
+optional = true
 
 [dependencies.futures-util]
 version = "0.3"
+optional = true
 
 [features]
 default = []
 yolo = ["dep:ort"]
 camera = ["dep:nokhwa"]
-rtsp = ["dep:ffmpeg-next"]
+rtsp = ["dep:ffmpeg-next", "dep:tokio-stream", "dep:futures-util"]
 vlm = ["dep:reqwest", "dep:base64"]

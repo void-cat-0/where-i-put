@@ -19,8 +19,9 @@ pub fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     if union <= 0.0 { 0.0 } else { inter / union }
 }
 
-/// Greedy NMS over (label, score, box): sort by score, keep a box if its IoU
-/// with every kept box of the same label is below `threshold`.
+/// Greedy NMS over (label, score, box): sort by score, keep a box when its IoU
+/// with every already-kept box of the same label is at most `threshold` (a box
+/// exactly at the threshold survives; only `iou > threshold` suppresses).
 pub fn nms<T: LabelBox>(dets: &[T], threshold: f32) -> Vec<usize> {
     let mut order: Vec<usize> = (0..dets.len()).collect();
     order.sort_by(|&i, &j| dets[j].score().total_cmp(&dets[i].score()));

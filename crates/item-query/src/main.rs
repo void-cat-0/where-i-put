@@ -1,8 +1,13 @@
 //! item-query CLI:
 //!   item-query log keys            # raw recent sightings
 //!   item-query ask "where are my keys"  # optionally through the VLM sidecar
-//! VLM is used only when ITEM_VLM_BASE_URL (and optionally ITEM_VLM_MODEL)
-//! are set; otherwise `ask` prints the log rows it would have sent.
+//! VLM is used only when ITEM_VLM_BASE_URL and ITEM_VLM_MODEL are both set;
+//! otherwise `ask` prints the log rows it would have sent.
+//!
+//! This is the read side, so it opens the database **read-only**: a typo in
+//! `--db` fails with "no such database" instead of creating an empty one and
+//! answering "no sightings" from it, and it can never take the write lock the
+//! ingest daemon needs.
 
 use clap::{Parser, Subcommand};
 
@@ -37,41 +42,29 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let args = Args::parse();
-    let store = Store::open(&args.db)?;
+    let store = Store::open_read_only(&args.db).with_context(|| {
+        format!(
+            "reading {} (has the ingest loop written it yet? --db selects another one)",
+            args.db
+        )
+    })?;
 
     match args.cmd {
         Cmd::Log { label, limit } => {
-            print_rows(&store.recent(label.as_deref(), limit)?);
+            let rows = store.recent(label.as_deref(), limit)?;
+            if rows.is_empty() {
+                println!("no sightings recorded");
+                return Ok(());
+            }
+            print_rows(&rows);
         }
         Cmd::Ask { question, label } => {
-            let needle = label.as_deref().unwrap_or(question.as_str());
-            // crude v1 keyword extraction: first content word, skipping
-            // interrogatives/pronouns ("where are my keys" -> "keys")
-            let word = needle
-                .split_whitespace()
-                .map(str::to_lowercase)
-                .find(|w| {
-                    w.chars().filter(|c| c.is_alphabetic()).count() >= 2
-                        && !matches!(
-                            w.as_str(),
-                            "where"
-                                | "is"
-                                | "are"
-                                | "my"
-                                | "the"
-                                | "did"
-                                | "do"
-                                | "i"
-                                | "put"
-                                | "see"
-                                | "was"
-                                | "at"
-                                | "in"
-                                | "on"
-                        )
-                })
-                .unwrap_or_else(|| needle.to_lowercase());
+            // An explicit --label is used verbatim (it is already a filter the
+            // user typed); a question is reduced to its content word.
+            let word = label.unwrap_or_else(|| item_query::keyword_of(&question));
             let obs = store.recent(Some(&word), 20)?;
             if obs.is_empty() {
                 println!("no sightings recorded for '{word}'");

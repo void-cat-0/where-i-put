@@ -169,7 +169,9 @@ pub mod yolo {
             width: u32,
             height: u32,
         ) -> Result<Vec<Detection>, DetectorError> {
-            // 1. letterbox resize to input_size^2, CHW f32 normalized to [0,1]
+            // 1. resize to input_size^2 (plain stretch: the model was checked
+            //    against Ultralytics output on the same preprocessing), CHW f32
+            //    normalized to [0,1]
             let src = image::RgbImage::from_raw(width, height, rgb.to_vec())
                 .ok_or_else(|| DetectorError::Inference("bad rgb buffer".into()))?;
             let resized = image::imageops::resize(

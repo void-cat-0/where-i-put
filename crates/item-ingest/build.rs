@@ -36,24 +36,30 @@ fn main() {
             return;
         }
     };
-    // OUT_DIR = target/<profile>/build/<pkg>-<hash>/out -> walk up to <profile>.
+    // OUT_DIR is target/<profile>/build/<pkg>-<hash>/out -- and, on toolchains
+    // with the newer build-directory layout, target/<profile>/build/<pkg>/
+    // <hash>/out. The profile directory is therefore whichever ancestor cargo
+    // names after PROFILE, not a fixed number of hops up (a custom
+    // `--profile dist` lands there too). If it cannot be found, skip the
+    // staging step rather than fail a build over a convenience copy.
+    let profile = env::var("PROFILE").unwrap_or_default();
     let out_dir = env::var_os("OUT_DIR").map(PathBuf::from).expect("OUT_DIR");
-    let profile_dir = out_dir
+    let Some(profile_dir) = out_dir
         .ancestors()
-        .find(|p| {
-            matches!(
-                p.file_name().and_then(|n| n.to_str()),
-                Some("debug") | Some("release")
-            )
-        })
-        .expect("OUT_DIR under target/<profile>/");
+        .find(|p| p.file_name().is_some_and(|n| n == profile.as_str()))
+    else {
+        println!(
+            "cargo:warning=could not place the {} profile directory above {}; \
+             FFmpeg DLLs were not staged next to the binary",
+            profile,
+            out_dir.display()
+        );
+        return;
+    };
     let mut copied = 0usize;
     for dll in &dlls {
         let dst = profile_dir.join(dll.file_name().unwrap());
-        let fresh = dst
-            .metadata()
-            .is_ok_and(|m| m.len() == dll.metadata().map(|s| s.len()).unwrap_or(u64::MAX));
-        if fresh {
+        if is_fresh(dll, &dst) {
             continue;
         }
         match fs::copy(dll, &dst) {
@@ -70,4 +76,19 @@ fn main() {
              (rtsp feature; re-runs only when they are missing or changed)"
         );
     }
+}
+
+/// Already staged, and not older than the source. Size alone is not enough: a
+/// same-size replacement (or a hand-deleted copy) would otherwise be treated as
+/// up to date, and the exe would fail to start for a missing DLL.
+fn is_fresh(src: &Path, dst: &Path) -> bool {
+    let (Ok(src), Ok(dst)) = (src.metadata(), dst.metadata()) else {
+        return false;
+    };
+    dst.len() == src.len()
+        && match (src.modified(), dst.modified()) {
+            (Ok(src), Ok(dst)) => dst >= src,
+            // No usable mtime: copy, it is cheaper than a broken binary.
+            _ => false,
+        }
 }

@@ -78,6 +78,11 @@ struct Artifact {
     urls: Vec<String>,
     sha256: Option<String>,
     kind: ArtifactKind,
+    /// A file that proves a cached directory is a *complete* unpack of this
+    /// artifact, relative to that directory. The directory alone is not
+    /// evidence: `manifest.json` lives in it too, so a half-deleted (or
+    /// AV-quarantined) payload would still read as `[cached]`.
+    marker: &'static str,
 }
 
 impl Artifact {
@@ -113,6 +118,7 @@ fn artifacts() -> Vec<Artifact> {
                     .find(|(k, _)| *k == os)
                     .map(|(_, v)| v.to_string()),
                 kind: ArtifactKind::ArchiveFlatten,
+                marker: "include/libavcodec/avcodec.h",
             }
         }
         _ => Artifact {
@@ -120,6 +126,7 @@ fn artifacts() -> Vec<Artifact> {
             urls: vec![],
             sha256: None,
             kind: ArtifactKind::NotProvided,
+            marker: "",
         },
     };
     let libclang = if os == "win64" {
@@ -131,6 +138,7 @@ fn artifacts() -> Vec<Artifact> {
                 .collect(),
             sha256: Some(pins::LIBCLANG_WIN_SHA.into()),
             kind: ArtifactKind::LibclangDll,
+            marker: "native/libclang.dll",
         }
     } else {
         Artifact {
@@ -138,6 +146,7 @@ fn artifacts() -> Vec<Artifact> {
             urls: vec![],
             sha256: None,
             kind: ArtifactKind::NotProvided,
+            marker: "",
         }
     };
     vec![ffmpeg, libclang]
@@ -169,18 +178,20 @@ enum Cmd {
 }
 
 /// `target/vendor` — deliberately under target/ so `cargo clean` wipes it.
+///
+/// Resolved from the **workspace root**, not the process cwd: `cargo xtask`
+/// runs from any subdirectory, and `.cargo/config.toml` points FFMPEG_DIR at
+/// the workspace root's `target/vendor` — installing anywhere else would leave
+/// the build reading a directory setup never filled. An explicit
+/// `CARGO_TARGET_DIR` wins, because that is where cargo actually puts target/.
 fn vendor_dir() -> Result<PathBuf> {
-    let out = std::env::var("CARGO_TARGET_OUT_DIR")
-        .or_else(|_| std::env::var("CARGO_TARGET_DIR"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("target"));
-    // CARGO_TARGET_OUT_DIR points at target/<profile>; go up one.
-    Ok(if out.ends_with("debug") || out.ends_with("release") {
-        out.parent().map(PathBuf::from).unwrap_or(out)
-    } else {
-        out
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        return Ok(PathBuf::from(dir).join("vendor"));
     }
-    .join("vendor"))
+    // crates/xtask -> crates -> workspace root
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest.parent().and_then(Path::parent).unwrap_or(manifest);
+    Ok(root.join("target").join("vendor"))
 }
 
 /// Written after a successful install; its presence + field match gates
@@ -240,7 +251,7 @@ fn install_status(root: &Path, art: &Artifact) -> Status {
                 .sha256
                 .as_ref()
                 .is_none_or(|pin| m.sha256.as_deref() == Some(pin))
-            && root.join(art.name).exists()
+            && root.join(art.name).join(art.marker).exists()
     };
     if fresh { Status::Cached } else { Status::Stale }
 }
@@ -275,6 +286,30 @@ fn verify_sha256(bytes: &[u8], want: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject an archive member that would land outside `dst`.
+///
+/// Pins make this near-unreachable (the bytes are sha256-verified *before*
+/// unpacking), but an unpacker that can be talked into writing `../` by the
+/// archive it is given is the wrong default, and `zip::ZipFile::name` and
+/// `tar::Entry::path` are both documented as untrusted.
+fn safe_join(dst: &Path, rel: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let escapes = rel.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    });
+    if rel.as_os_str().is_empty() || escapes {
+        bail!(
+            "refusing archive member {}: it would write outside {}",
+            rel.display(),
+            dst.display()
+        );
+    }
+    Ok(dst.join(rel))
+}
+
 /// Unpack a .zip (Windows FFmpeg build, libclang wheel). When `strip_top`,
 /// drop the first path component (BtbN archives wrap contents in one dir).
 /// `only` keeps members whose path contains that substring; they are written
@@ -295,16 +330,17 @@ fn unpack_zip(bytes: &[u8], dst: &Path, strip_top: bool, only: Option<&str>) -> 
         if rel.is_empty() || entry.is_dir() {
             continue;
         }
-        let target = match only {
+        let rel = match only {
             Some(f) => {
                 let idx = match rel.find(f) {
                     Some(i) => i,
                     None => continue,
                 };
-                dst.join(&rel[idx..])
+                rel[idx..].to_string()
             }
-            None => dst.join(&rel),
+            None => rel,
         };
+        let target = safe_join(dst, Path::new(&rel))?;
         if let Some(p) = target.parent() {
             fs::create_dir_all(p)?;
         }
@@ -326,11 +362,10 @@ fn unpack_tar_xz(bytes: &[u8], dst: &Path) -> Result<()> {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
         let stripped = path.components().skip(1).collect::<PathBuf>();
-        let rel = match stripped.to_str() {
-            Some(s) if !s.is_empty() => s,
-            _ => continue,
+        let Some(rel) = stripped.to_str().filter(|s| !s.is_empty()) else {
+            continue;
         };
-        let target = dst.join(rel);
+        let target = safe_join(dst, Path::new(rel))?;
         if entry.header().entry_type().is_dir() {
             fs::create_dir_all(target)?;
             continue;
@@ -357,7 +392,8 @@ fn note_for(name: &str) -> &'static str {
 
 /// Minimal toolchain required to build FFmpeg from source: its ./configure is
 /// a POSIX shell script (needs sh + perl), the build needs make, x86 asm
-/// needs nasm. Probe without assuming --version flags work uniformly.
+/// needs nasm, and on Windows configure drives MSVC (cl.exe). Probe without
+/// assuming --version flags work uniformly.
 fn probe(cmd: &str, args: &[&str]) -> bool {
     std::process::Command::new(cmd)
         .args(args)
@@ -365,6 +401,18 @@ fn probe(cmd: &str, args: &[&str]) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// Does the command exist at all? `cl.exe` exits non-zero when invoked
+/// argument-less (it prints its banner and a usage error), so its status is
+/// not a usable signal -- being able to start it is.
+fn probe_starts(cmd: &str, args: &[&str]) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn require_build_tools() -> Result<()> {
@@ -383,6 +431,14 @@ fn require_build_tools() -> Result<()> {
     }
     if !probe("nasm", &["-v"]) {
         missing.push(("nasm", "x86 asm backend; MSYS2: pacman -S nasm; Linux: apt install nasm; macOS: brew install nasm"));
+    }
+    if cfg!(windows) && !probe_starts("cl", &["/?"]) {
+        missing.push((
+            "cl",
+            "Windows configure runs with --toolchain=msvc: start this from an \
+             x64 Native Tools command prompt (or the MSVC developer shell), or \
+             run the configure/make steps inside MSYS2 with cl.exe on PATH",
+        ));
     }
     if !missing.is_empty() {
         let mut msg =
@@ -440,8 +496,9 @@ const SRC_CONFIGURE: &[&str] = &[
 ];
 
 /// Build FFmpeg from the pinned upstream tarball into target/vendor/ffmpeg/
-/// (the canonical FFMPEG_DIR; this intentionally replaces a zip install —
-/// `setup` without the flag restores the zip). Several minutes: configure's
+/// (the canonical FFMPEG_DIR; this intentionally replaces a zip install, and
+/// `cargo xtask setup --force` is what puts the prebuilt zip back -- plain
+/// `setup` sees a valid cache and skips). Several minutes: configure's
 /// self-tests dominate, then make.
 fn build_from_source(root: &Path) -> Result<()> {
     require_build_tools()?;
@@ -452,7 +509,8 @@ fn build_from_source(root: &Path) -> Result<()> {
 
     let src = root.join("ffmpeg-src");
     if src.exists() {
-        fs::remove_dir_all(&src).ok();
+        fs::remove_dir_all(&src)
+            .with_context(|| format!("clearing the previous source tree at {}", src.display()))?;
     }
     fs::create_dir_all(&src)?;
     unpack_tar_xz(&bytes, &src)?;
@@ -460,7 +518,12 @@ fn build_from_source(root: &Path) -> Result<()> {
     let prefix = root.join("ffmpeg");
     if prefix.exists() {
         // full replace keeps the artifact reproducible from the pinned tarball
-        fs::remove_dir_all(&prefix).ok();
+        fs::remove_dir_all(&prefix).with_context(|| {
+            format!(
+                "clearing {} before the source install (is a loaded DLL using it?)",
+                prefix.display()
+            )
+        })?;
     }
     fs::create_dir_all(&prefix)?;
 
@@ -572,7 +635,16 @@ fn install(root: &Path, art: &Artifact) -> Result<()> {
     };
     let dir = root.join(art.name);
     if dir.exists() {
-        fs::remove_dir_all(&dir).ok();
+        // Must succeed: unpacking over a partly-removed tree would leave a
+        // mixture the manifest then certifies as a clean install of these
+        // bytes. On Windows a loaded DLL (the staged FFmpeg runtime) makes
+        // this fail, and failing loudly is the only honest answer.
+        fs::remove_dir_all(&dir).with_context(|| {
+            format!(
+                "clearing {} before reinstall (is a build or a staged DLL using it?)",
+                dir.display()
+            )
+        })?;
     }
     fs::create_dir_all(&dir)?;
     match art.kind {
@@ -605,9 +677,24 @@ fn main() -> Result<()> {
     match args.cmd {
         Cmd::Status => {
             let mut all_ready = true;
+            let mut from_system = false;
             for art in artifacts() {
                 match install_status(&root, &art) {
-                    Status::Cached => println!("[cached]  {}", art.name),
+                    // The flavor matters: a `source` tree and the prebuilt zip
+                    // are both "cached", and only one of them is what plain
+                    // `setup` would install.
+                    Status::Cached => {
+                        let flavor = Manifest::load(&root, art.name)
+                            .map(|m| {
+                                if m.flavor == "source" {
+                                    " (built from source)"
+                                } else {
+                                    ""
+                                }
+                            })
+                            .unwrap_or("");
+                        println!("[cached]  {}{flavor}", art.name);
+                    }
                     Status::Missing => {
                         all_ready = false;
                         println!("[missing] {}", art.name)
@@ -616,19 +703,26 @@ fn main() -> Result<()> {
                         all_ready = false;
                         println!("[stale]   {} (pins or platform changed)", art.name)
                     }
-                    Status::NotProvided => println!(
-                        "[n/a]     {} ({} — see setup message)",
-                        art.name,
-                        platform()
-                    ),
+                    Status::NotProvided => {
+                        from_system = true;
+                        println!(
+                            "[n/a]     {} ({} — see setup message)",
+                            art.name,
+                            platform()
+                        )
+                    }
                 }
             }
             println!(
                 "\n{}",
-                if all_ready {
-                    "ready: cargo build --features rtsp"
-                } else {
-                    "run: cargo xtask setup"
+                match (all_ready, from_system) {
+                    (true, false) => "ready: cargo build --features rtsp".to_string(),
+                    // macOS: nothing was fetched on purpose, so "ready" only
+                    // holds if the system FFmpeg is actually installed.
+                    (true, true) => "ready: cargo build --features rtsp (using the system \
+                                     FFmpeg/libclang where marked n/a)"
+                        .to_string(),
+                    (false, _) => "run: cargo xtask setup".to_string(),
                 }
             );
             Ok(())
@@ -654,8 +748,9 @@ fn main() -> Result<()> {
                 }
                 println!(
                     "\nfrom-source setup complete: FFMPEG_DIR is a locally built \
-                          shared tree (same layout as the zip; run `cargo xtask setup` \
-                          without the flag to restore the prebuilt zip)."
+                     shared tree (same layout as the zip). This counts as a valid \
+                     cache, so `cargo xtask setup --force` is what restores the \
+                     prebuilt zip."
                 );
                 return Ok(());
             }

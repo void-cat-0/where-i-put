@@ -59,13 +59,6 @@ pub struct Recorded {
     pub hits: i64,
 }
 
-impl Recorded {
-    /// The `(camera_id, zone, label)` dedup identity this sighting belongs to.
-    pub fn key(&self) -> (&str, &str) {
-        (&self.zone, &self.label)
-    }
-}
-
 /// Persist one frame's detections: NMS them, map centers to zones, record.
 /// When `frame_rgb` + `snapshots_dir` are provided and a sighting opens a NEW
 /// observation, the frame is annotated (all surviving boxes in label colors,
