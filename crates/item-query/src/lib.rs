@@ -3,8 +3,10 @@
 //! v1 lookup is a plain label substring search over observations; the VLM
 //! sidecar (OpenAI-compatible endpoint) formats the answer when configured.
 
+pub mod containment;
 pub mod vlm;
 
+use crate::containment::Candidate;
 use item_core::Observation;
 
 /// The one content word a plain-language question is about
@@ -45,8 +47,18 @@ fn normalize_word(word: &str) -> String {
 
 /// Build the sighting-log prompt fed to the VLM.
 pub fn build_prompt(query: &str, obs: &[Observation]) -> String {
+    build_prompt_with_candidates(query, obs, &[])
+}
+
+/// Keep direct sightings ahead of derived hypotheses. A hypothesis is labelled
+/// explicitly so a VLM cannot turn a 2-D relation into a fact.
+pub fn build_prompt_with_candidates(
+    query: &str,
+    obs: &[Observation],
+    candidates: &[Candidate],
+) -> String {
     use std::fmt::Write;
-    let mut s = String::from("Sighting log (most recent first):\n");
+    let mut s = String::from("Direct sighting log (most recent first):\n");
     if obs.is_empty() {
         s.push_str("(empty)\n");
     }
@@ -62,9 +74,24 @@ pub fn build_prompt(query: &str, obs: &[Observation]) -> String {
         )
         .unwrap();
     }
+    if !candidates.is_empty() {
+        s.push_str("\nDerived cover hypotheses (never direct sightings):\n");
+        for candidate in candidates {
+            writeln!(
+                s,
+                "- {} may be {} {}; heuristic score {:.2}; {}",
+                candidate.target_label,
+                candidate.relation,
+                candidate.cover_label,
+                candidate.score,
+                candidate.explanation,
+            )
+            .unwrap();
+        }
+    }
     write!(
         s,
-        "\nQuestion: \"{query}\". Answer in one or two sentences using only the log."
+        "\nQuestion: \"{query}\". Answer in one or two sentences. State the direct last-seen location first, then append a clearly qualified hypothesis only if one is listed. Never present a hypothesis as a direct observation."
     )
     .unwrap();
     s

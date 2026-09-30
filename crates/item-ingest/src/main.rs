@@ -118,6 +118,28 @@ struct Args {
     #[arg(long)]
     detect: Option<String>,
 
+    /// Relative-depth provider: none or relative-vlm. Enabling relative-vlm
+    /// without its cargo feature is a hard startup error.
+    #[arg(long)]
+    depth_provider: Option<String>,
+
+    /// OpenAI-compatible relative-depth endpoint, including /v1.
+    #[arg(long)]
+    depth_base_url: Option<String>,
+
+    /// Relative-depth model name.
+    #[arg(long)]
+    depth_model: Option<String>,
+
+    /// Relative-depth request timeout in seconds; zero is invalid.
+    #[arg(long)]
+    depth_timeout: Option<u64>,
+
+    /// With --detect: write ordinal depth evidence JSON for the image.
+    #[cfg(any(feature = "yolo", feature = "vlm"))]
+    #[arg(long)]
+    depth_out: Option<String>,
+
     /// With --detect: save an annotated copy (boxes + label chips, first box
     /// highlighted like an observation snapshot) to this path. Format follows
     /// the file extension.
@@ -194,6 +216,9 @@ fn main() -> anyhow::Result<()> {
         &cli_overrides(&args),
         &item_ingest::config::EnvOverrides::from_env(),
     );
+    settings
+        .validate(file_config.as_ref())
+        .map_err(|e| anyhow::anyhow!(e))?;
     // Log the resolved shape, never the values that carry credentials.
     tracing::debug!(
         db = %settings.db,
@@ -225,6 +250,16 @@ fn main() -> anyhow::Result<()> {
         return maintenance_pass(settings, args.force);
     }
 
+    #[cfg(any(feature = "yolo", feature = "vlm"))]
+    if let Some(img) = args.detect.as_deref() {
+        return detect_pass(
+            &settings,
+            img,
+            args.out.as_deref(),
+            args.depth_out.as_deref(),
+        );
+    }
+
     if let Some(dir) = Path::new(&settings.db).parent() {
         std::fs::create_dir_all(dir).ok();
     }
@@ -241,11 +276,6 @@ fn main() -> anyhow::Result<()> {
 
     if args.demo {
         return demo_pass(&store);
-    }
-
-    #[cfg(any(feature = "yolo", feature = "vlm"))]
-    if let Some(img) = args.detect.as_deref() {
-        return detect_pass(&settings, img, args.out.as_deref());
     }
 
     #[cfg(feature = "rtsp")]
@@ -308,6 +338,11 @@ fn config_dir(args: &Args) -> std::path::PathBuf {
 fn cli_overrides(args: &Args) -> CliOverrides {
     #[allow(unused_mut)]
     let mut o = CliOverrides {
+        depth_provider: args.depth_provider.clone(),
+        depth_base_url: args.depth_base_url.clone(),
+        depth_model: args.depth_model.clone(),
+        depth_timeout: args.depth_timeout,
+
         db: args.db.clone(),
         snapshots_dir: args.snapshots_dir.clone(),
         listen: args.listen.clone(),
@@ -555,7 +590,12 @@ fn warn_about_force(settings: &RuntimeConfig) {
 /// copy (all boxes with label chips; the first one highlighted thick with
 /// its white ring, like a freshly born observation snapshot).
 #[cfg(any(feature = "yolo", feature = "vlm"))]
-fn detect_pass(settings: &RuntimeConfig, img_path: &str, out: Option<&str>) -> anyhow::Result<()> {
+fn detect_pass(
+    settings: &RuntimeConfig,
+    img_path: &str,
+    out: Option<&str>,
+    depth_out: Option<&str>,
+) -> anyhow::Result<()> {
     use std::time::Instant;
 
     let img = image::open(img_path)
@@ -590,6 +630,34 @@ fn detect_pass(settings: &RuntimeConfig, img_path: &str, out: Option<&str>) -> a
             d.bbox[2],
             d.bbox[3]
         );
+    }
+    if let Some(path) = depth_out {
+        let spec = settings
+            .depth_spec_for(None)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let provider = item_ingest::runtime::build_depth(&spec)?;
+        let estimates = provider
+            .estimate(img.as_raw(), w, h, &kept)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let json = serde_json::to_string_pretty(
+            &estimates
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "index": e.index,
+                        "relation_to_camera": e.relation_to_camera.as_str(),
+                        "relative_score": e.relative_score,
+                        "quality": e.quality.as_str(),
+                        "frame_id": e.frame_id,
+                        "response_id": e.response_id,
+                        "prompt_version": e.prompt_version,
+                        "backend_version": e.backend_version,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        std::fs::write(path, json).with_context(|| format!("saving {path}"))?;
+        println!("relative-depth evidence saved to {path}");
     }
     if let Some(out) = out {
         let refs: Vec<&item_core::Detection> = kept.iter().collect();
@@ -637,6 +705,9 @@ fn camera_task(
         camera_id: settings.camera_id.clone(),
         source: Some(source),
         detector: detector_spec(settings)?,
+        depth: settings
+            .depth_spec_for(None)
+            .map_err(|e| anyhow::anyhow!(e))?,
         detect_fps: settings.detect_fps(),
         snapshot_dir: Path::new(&settings.snapshots_dir).to_path_buf(),
         events_path: settings.events_path(),

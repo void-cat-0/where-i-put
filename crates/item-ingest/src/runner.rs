@@ -93,6 +93,7 @@ impl Default for CameraHealth {
 pub struct CameraRunner {
     task: CameraTask,
     detector: Box<dyn Detector>,
+    depth: Box<dyn crate::depth::RelativeDepthProvider>,
     source: Option<Box<dyn FrameSource>>,
     interval: Duration,
     /// `None` = the next frame is due immediately. (The historical loop seeded
@@ -110,10 +111,23 @@ pub struct CameraRunner {
     /// to `log`, which stays `None` when event observation is off.
     tracker: Tracker,
     log: Option<EventLog>,
+    session_id: String,
 }
 
 impl CameraRunner {
-    pub fn new(task: CameraTask, detector: Box<dyn Detector>) -> Self {
+    /// Compatibility constructor for tests and featureless callers. Production
+    /// startup uses [`Self::try_new`] so an explicitly selected provider whose
+    /// cargo feature is absent is a fatal configuration error.
+    pub fn new(mut task: CameraTask, detector: Box<dyn Detector>) -> Self {
+        if let Err(e) = crate::runtime::build_depth(&task.depth) {
+            tracing::warn!(error = %e, "relative depth disabled; continuing without depth evidence");
+            task.depth = crate::runtime::DepthSpec::None;
+        }
+        Self::try_new(task, detector).expect("disabled depth provider always builds")
+    }
+
+    pub fn try_new(task: CameraTask, detector: Box<dyn Detector>) -> anyhow::Result<Self> {
+        let depth = crate::runtime::build_depth(&task.depth)?;
         let interval = task.detect_interval();
         let tracker = Tracker::new(interval);
         // An event log that cannot be opened is not a reason to refuse the
@@ -133,9 +147,10 @@ impl CameraRunner {
             },
             None => None,
         };
-        Self {
+        Ok(Self {
             task,
             detector,
+            depth,
             source: None,
             interval,
             last_detect: None,
@@ -149,7 +164,12 @@ impl CameraRunner {
             state: CameraState::Starting,
             tracker,
             log,
-        }
+            session_id: format!(
+                "{}-{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ),
+        })
     }
 
     /// Is this camera publishing an event timeline?
@@ -244,14 +264,29 @@ impl CameraRunner {
         };
         self.observe_inference(started.elapsed());
         self.detections += 1;
+        let depth = match self.depth.estimate(
+            &frame.rgb,
+            frame.meta.width,
+            frame.meta.height,
+            &dets,
+        ) {
+            Ok(depth) => depth,
+            Err(e) => {
+                tracing::warn!(error = %e, "relative depth unavailable; preserving detections without depth evidence");
+                Vec::new()
+            }
+        };
 
-        let recorded = crate::ingest_detections(
+        let recorded = crate::ingest_detections_with_depth(
             store,
             &frame.meta,
             &dets,
             0.45,
             0.0, // the detector already floors at conf
             Some((&frame.rgb, self.task.snapshot_dir.as_path())),
+            &depth,
+            (!depth.is_empty()).then_some(self.depth.provider_name()),
+            self.depth.model_ref(),
         )?;
         self.recorded += recorded.len() as u64;
         if !recorded.is_empty() {
@@ -261,7 +296,12 @@ impl CameraRunner {
                 "detections ingested"
             );
         }
-        self.emit_events(&frame.meta.camera_id, &recorded, frame.meta.captured_at);
+        self.emit_events(
+            store,
+            &frame.meta.camera_id,
+            &recorded,
+            frame.meta.captured_at,
+        );
         Ok(StepOutcome::Detected {
             recorded: recorded.len(),
         })
@@ -276,6 +316,7 @@ impl CameraRunner {
     /// a camera a frame.
     fn emit_events(
         &mut self,
+        store: &Store,
         camera_id: &str,
         recorded: &[crate::Recorded],
         now: chrono::DateTime<chrono::Utc>,
@@ -290,6 +331,10 @@ impl CameraRunner {
                     obs_id: row.obs_id,
                     is_new: row.is_new,
                     hits: row.hits,
+                    bbox: row.bbox,
+                    frame_width: row.frame_width,
+                    frame_height: row.frame_height,
+                    geometry_id: row.geometry_id,
                 },
                 now,
             ));
@@ -297,10 +342,36 @@ impl CameraRunner {
         // Sweep after recording, so a key hit by this very frame is refreshed
         // before it can be judged stale.
         events.extend(self.tracker.sweep(now));
-        self.write_events(&events);
+        self.persist_events(store, &events);
     }
 
-    /// Append events, logging but never propagating a failure.
+    /// Append events to the operational JSONL and authoritative SQLite table.
+    /// A failure in either evidence sink is logged without killing the camera.
+    fn persist_events(&mut self, store: &Store, events: &[crate::events::Event]) {
+        self.write_events(events);
+        for event in events {
+            let input = item_core::ObservationEventInput {
+                observation_id: event.obs_id,
+                camera_id: event.camera.clone(),
+                zone: event.zone.clone(),
+                label: event.label.clone(),
+                event_type: event.event.clone(),
+                occurred_at: event.occurred_at,
+                noticed_at: event.noticed_at,
+                source: "local_detector".into(),
+                session_id: Some(self.session_id.clone()),
+                reason: event.reason.clone(),
+                hits: event.hits,
+                seen_for_s: event.seen_for_s,
+                geometry_id: event.geometry_id,
+            };
+            if let Err(e) = store.freeze_and_append_observation_event(&input) {
+                tracing::warn!(error = %e, obs = event.obs_id, kind = %event.event, "lifecycle event persistence failed");
+            }
+        }
+    }
+
+    /// Append events to the operational JSONL, logging but never propagating a failure.
     fn write_events(&mut self, events: &[crate::events::Event]) {
         let Some(log) = self.log.as_mut() else {
             return;
@@ -320,12 +391,12 @@ impl CameraRunner {
     /// Close every open key and write the departures (§3: called before the
     /// final health write, because a disappearance is only noticed at the next
     /// scan and there is none after this).
-    pub fn flush_events(&mut self, now: chrono::DateTime<chrono::Utc>) {
+    pub fn flush_events(&mut self, store: &Store, now: chrono::DateTime<chrono::Utc>) {
         let events = self.tracker.flush_all(now);
         if !events.is_empty() {
             tracing::info!(closed = events.len(), "event timeline flushed at shutdown");
         }
-        self.write_events(&events);
+        self.persist_events(store, &events);
     }
 
     pub fn health(&self) -> CameraHealth {
@@ -421,6 +492,7 @@ mod tests {
                 height: 8,
             }),
             detector: DetectorSpec::Null, // unused: the detector is injected
+            depth: crate::runtime::DepthSpec::None,
             detect_fps: 1.0,
             snapshot_dir: dir.to_path_buf(),
             events_path: Some(dir.join("events.jsonl")),
@@ -444,6 +516,7 @@ mod tests {
                 height: 8,
             }),
             detector: DetectorSpec::Null,
+            depth: crate::runtime::DepthSpec::None,
             detect_fps: 1.0,
             snapshot_dir: std::path::PathBuf::from("unused"),
             events_path: None,
@@ -584,7 +657,7 @@ mod tests {
         let gone = r
             .tracker
             .sweep(chrono::Utc::now() + chrono::Duration::seconds(120));
-        r.write_events(&gone);
+        r.persist_events(&store, &gone);
 
         let events = read_events(r.log.as_ref().unwrap().path());
         assert_eq!(events.len(), 2, "appeared then disappeared: {events:?}");
@@ -619,7 +692,7 @@ mod tests {
         r.open().unwrap();
         r.step(&store).unwrap();
 
-        r.flush_events(chrono::Utc::now());
+        r.flush_events(&store, chrono::Utc::now());
 
         let events = read_events(r.log.as_ref().unwrap().path());
         assert_eq!(events.len(), 2);
@@ -640,6 +713,6 @@ mod tests {
             r.step(&store).unwrap(),
             StepOutcome::Detected { recorded: 0 }
         ));
-        r.flush_events(chrono::Utc::now()); // must be a harmless no-op
+        r.flush_events(&store, chrono::Utc::now()); // must be a harmless no-op
     }
 }

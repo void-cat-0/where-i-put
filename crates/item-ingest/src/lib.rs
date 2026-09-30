@@ -10,6 +10,7 @@
 pub mod annotate;
 pub mod config;
 pub mod daemon;
+pub mod depth;
 pub mod detector;
 pub mod events;
 pub mod frigate;
@@ -29,7 +30,7 @@ use thiserror::Error;
 
 use item_core::geo::nms;
 use item_core::store::Store;
-use item_core::{Detection, FrameMeta, Region};
+use item_core::{DepthInput, Detection, FrameMeta, GeometryInput, Region, SightingInput};
 
 #[derive(Debug, Error)]
 pub enum IngestError {
@@ -50,13 +51,19 @@ pub type Result<T> = std::result::Result<T, IngestError>;
 /// a bare count. `hits` is reported as of this sighting, so a later
 /// disappearance can say how often the object was seen before it went
 /// (docs/resident-ingest.md §6).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Recorded {
     pub obs_id: i64,
     pub zone: String,
     pub label: String,
     pub is_new: bool,
     pub hits: i64,
+    /// The surviving detector geometry that produced this sighting.
+    pub bbox: [f32; 4],
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub captured_at: chrono::DateTime<chrono::Utc>,
+    pub geometry_id: i64,
 }
 
 /// Persist one frame's detections: NMS them, map centers to zones, record.
@@ -76,11 +83,38 @@ pub fn ingest_detections(
     min_confidence: f32,
     frame_rgb: Option<(&[u8], &std::path::Path)>,
 ) -> Result<Vec<Recorded>> {
-    let owned: Vec<Detection> = dets
+    ingest_detections_with_depth(
+        store,
+        meta,
+        dets,
+        nms_iou_threshold,
+        min_confidence,
+        frame_rgb,
+        &[],
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ingest_detections_with_depth(
+    store: &Store,
+    meta: &FrameMeta,
+    dets: &[Detection],
+    nms_iou_threshold: f32,
+    min_confidence: f32,
+    frame_rgb: Option<(&[u8], &std::path::Path)>,
+    depth: &[crate::depth::DepthEstimate],
+    depth_provider: Option<&str>,
+    depth_model: Option<&str>,
+) -> Result<Vec<Recorded>> {
+    let owned_indices: Vec<usize> = dets
         .iter()
-        .filter(|d| d.confidence >= min_confidence)
-        .cloned()
+        .enumerate()
+        .filter(|(_, d)| d.confidence >= min_confidence)
+        .map(|(i, _)| i)
         .collect();
+    let owned: Vec<Detection> = owned_indices.iter().map(|&i| dets[i].clone()).collect();
     let keep = nms(&owned, nms_iou_threshold);
     let survivors: Vec<&Detection> = keep.iter().map(|&i| &owned[i]).collect();
     // Zones come from the DB and only matter for annotated snapshots, so the
@@ -94,14 +128,57 @@ pub fn ingest_detections(
     for (hi, idx) in keep.into_iter().enumerate() {
         let det = &owned[idx];
         let zone = store.zone_for_point(&meta.camera_id, det.center())?;
-        let (id, is_new, hits) = store.record_sighting(
-            &meta.camera_id,
-            &zone,
-            &det.label,
-            meta.captured_at,
-            meta.snapshot_path.as_deref(),
-            item_core::store::DEFAULT_DEDUP_WINDOW,
-        )?;
+        let source_index = owned_indices[idx];
+        let depth_input = depth
+            .iter()
+            .find(|e| e.index == source_index)
+            .and_then(|estimate| {
+                depth_provider.map(|provider| DepthInput {
+                    provider: provider.to_string(),
+                    frame_id: estimate.frame_id.clone(),
+                    response_id: estimate.response_id.clone(),
+                    prompt_version: estimate.prompt_version.clone(),
+                    backend_version: estimate.backend_version.clone(),
+                    mode: "relative".into(),
+                    relation_to_camera: estimate.relation_to_camera.as_str().into(),
+                    relative_score: estimate.relative_score,
+                    quality: estimate.quality.as_str().into(),
+                    model_ref: depth_model.map(str::to_string),
+                    value_m: None,
+                    uncertainty_m: None,
+                    valid_fraction: None,
+                    coordinate_frame: None,
+                    calibration_ref: None,
+                })
+            });
+        let input = SightingInput {
+            camera_id: meta.camera_id.clone(),
+            zone: zone.clone(),
+            label: det.label.clone(),
+            seen_at: meta.captured_at,
+            snapshot: meta.snapshot_path.clone(),
+            window_seconds: item_core::store::DEFAULT_DEDUP_WINDOW.as_secs(),
+            geometry: Some(GeometryInput {
+                sample_kind: "last".into(),
+                captured_at: meta.captured_at,
+                bbox: det.bbox,
+                frame_width: Some(meta.width),
+                frame_height: Some(meta.height),
+                zone: zone.clone(),
+                source: "local_detector".into(),
+                confidence: Some(det.confidence),
+                snapshot_ref: meta.snapshot_path.clone(),
+            }),
+            depth: depth_input,
+        };
+        let (id, is_new, hits, geometry_id) = store.record_sighting_with_geometry(&input)?;
+        // The typed sighting transaction owns both bounded samples and depth;
+        // the returned id identifies this input, even when it arrived late.
+        let geometry_id = geometry_id.ok_or_else(|| {
+            item_core::store::StoreError::InvalidInput(
+                "sighting did not return input geometry".into(),
+            )
+        })?;
         // A failed snapshot must not break ingestion; also only the FIRST
         // sighting of an observation gets an image -- and that image is
         // re-rendered per row, so each one highlights THIS row's box.
@@ -122,6 +199,11 @@ pub fn ingest_detections(
             label: det.label.clone(),
             is_new,
             hits,
+            bbox: det.bbox,
+            frame_width: meta.width,
+            frame_height: meta.height,
+            captured_at: meta.captured_at,
+            geometry_id,
         });
     }
     tracing::debug!(camera = %meta.camera_id, recorded = recorded.len(), "frame ingested");
@@ -206,6 +288,11 @@ mod tests {
                 label: "bottle".into(),
                 is_new: true,
                 hits: 1,
+                bbox: [8.0, 8.0, 40.0, 32.0],
+                frame_width: 64,
+                frame_height: 48,
+                captured_at: meta.captured_at,
+                geometry_id: 2,
             },
             "the row identity the caller used to lose"
         );

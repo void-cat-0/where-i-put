@@ -249,6 +249,7 @@ fn drive(
         }
     };
 
+    let camera_id = task.camera_id.clone();
     let kind = task.source.as_ref().map(|s| s.kind()).unwrap_or("webhook");
     let source_desc = task
         .source
@@ -256,8 +257,25 @@ fn drive(
         .map(|s| s.describe())
         .unwrap_or_default();
 
-    let mut runner = CameraRunner::new(task, detector);
-    let camera_id = runner.task().camera_id.clone();
+    let mut runner = match CameraRunner::try_new(task, detector) {
+        Ok(runner) => runner,
+        Err(e) => {
+            let reason = format!("{e:#}");
+            tracing::error!(camera = %camera_id, error = %reason, "camera failed to start; depth provider unavailable");
+            if let Some(registry) = health.as_ref() {
+                registry.publish(
+                    &camera_id,
+                    crate::runner::CameraHealth {
+                        state: crate::runner::CameraState::Failed,
+                        last_error: Some(reason.clone()),
+                        ..Default::default()
+                    },
+                );
+            }
+            outcome.error = Some(reason);
+            return outcome;
+        }
+    };
 
     macro_rules! publish {
         () => {
@@ -357,7 +375,10 @@ fn drive(
     // key is reported as gone now, or the last real disappearance of the run
     // would be lost. Also runs for a camera that failed, since its keys are just
     // as abandoned.
-    runner.flush_events(chrono::Utc::now());
+    {
+        let store = store.lock().expect("store mutex poisoned");
+        runner.flush_events(&store, chrono::Utc::now());
+    }
 
     let final_health = runner.health();
     outcome.frames = final_health.frames;
@@ -401,6 +422,7 @@ mod tests {
                 height: 8,
             }),
             detector: DetectorSpec::Null,
+            depth: crate::runtime::DepthSpec::None,
             detect_fps: 1.0,
             snapshot_dir: std::path::PathBuf::from("unused"),
             events_path: None,

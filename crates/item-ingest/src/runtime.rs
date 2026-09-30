@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crate::depth::{NoDepthProvider, RelativeDepthProvider};
 use crate::detector::{Detector, NullDetector};
 use crate::source::{FrameSource, MockSource};
 
@@ -75,6 +76,17 @@ pub fn redact_url(url: &str) -> String {
     }
 }
 
+/// Which relative-depth evidence backend to run.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DepthSpec {
+    None,
+    RelativeVlm {
+        base_url: String,
+        model: String,
+        timeout: Duration,
+    },
+}
+
 /// Which detection backend to run.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DetectorSpec {
@@ -105,6 +117,7 @@ pub struct CameraTask {
     /// `None` = this camera is fed by the webhook only (no local capture).
     pub source: Option<SourceSpec>,
     pub detector: DetectorSpec,
+    pub depth: DepthSpec,
     pub detect_fps: f64,
     pub snapshot_dir: PathBuf,
     /// Where this camera's appeared/disappeared timeline is appended, or `None`
@@ -180,6 +193,45 @@ fn build_webcam(task: &CameraTask, index: u32) -> Result<Box<dyn FrameSource>> {
 #[cfg(not(feature = "camera"))]
 fn build_webcam(_task: &CameraTask, _index: u32) -> Result<Box<dyn FrameSource>> {
     anyhow::bail!("webcam source requires the 'camera' feature: rebuild with --features camera")
+}
+
+/// Build the detector for a spec.
+///
+/// A missing `yolo` feature degrades to `NullDetector` with a warning (the
+/// pipeline still runs); a missing `vlm` feature hard-errors, because a
+/// silently null VLM would be indistinguishable from a broken sidecar.
+pub fn build_depth(spec: &DepthSpec) -> Result<Box<dyn RelativeDepthProvider>> {
+    match spec {
+        DepthSpec::None => Ok(Box::new(NoDepthProvider)),
+        DepthSpec::RelativeVlm {
+            base_url,
+            model,
+            timeout,
+        } => build_relative_vlm(base_url, model, *timeout),
+    }
+}
+
+#[cfg(feature = "relative-depth")]
+fn build_relative_vlm(
+    base_url: &str,
+    model: &str,
+    timeout: Duration,
+) -> Result<Box<dyn RelativeDepthProvider>> {
+    let provider = crate::depth::RelativeVlmProvider::new(base_url, model, timeout)
+        .map_err(|e| anyhow::anyhow!("depth provider: {e}"))?;
+    tracing::info!(base = %base_url, model = %model, timeout_s = timeout.as_secs(), "relative depth provider enabled");
+    Ok(Box::new(provider))
+}
+
+#[cfg(not(feature = "relative-depth"))]
+fn build_relative_vlm(
+    _base_url: &str,
+    _model: &str,
+    _timeout: Duration,
+) -> Result<Box<dyn RelativeDepthProvider>> {
+    anyhow::bail!(
+        "relative-vlm depth requires the 'relative-depth' feature: rebuild with --features relative-depth"
+    )
 }
 
 /// Build the detector for a spec.
@@ -275,6 +327,7 @@ mod tests {
             camera_id: "cam".into(),
             source,
             detector: DetectorSpec::Null,
+            depth: DepthSpec::None,
             detect_fps: 1.0,
             snapshot_dir: PathBuf::from("unused"),
             events_path: None,

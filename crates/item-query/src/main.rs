@@ -11,7 +11,10 @@
 
 use clap::{Parser, Subcommand};
 
+use chrono::Duration;
 use item_core::store::Store;
+use item_query::build_prompt_with_candidates;
+use item_query::containment::{Candidate, find_candidates};
 use item_query::vlm::VlmClient;
 
 #[derive(Parser)]
@@ -38,6 +41,18 @@ enum Cmd {
         #[arg(long)]
         label: Option<String>,
     },
+    /// List conservative 2-D disappearance/cover hypotheses.
+    Candidates {
+        label: String,
+        #[arg(long)]
+        camera: Option<String>,
+        #[arg(long, default_value_t = 120)]
+        window_secs: i64,
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -61,6 +76,29 @@ async fn main() -> anyhow::Result<()> {
             }
             print_rows(&rows);
         }
+        Cmd::Candidates {
+            label,
+            camera,
+            window_secs,
+            limit,
+            json,
+        } => {
+            let observations = store.recent(Some(&label), limit)?;
+            let candidates = query_candidates(
+                &store,
+                &observations,
+                camera.as_deref(),
+                Duration::seconds(window_secs.clamp(1, 86_400)),
+                limit,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&candidates)?);
+            } else if candidates.is_empty() {
+                println!("no supported cover candidates for '{label}'");
+            } else {
+                print_candidates(&candidates);
+            }
+        }
         Cmd::Ask { question, label } => {
             // An explicit --label is used verbatim (it is already a filter the
             // user typed); a question is reduced to its content word.
@@ -70,25 +108,94 @@ async fn main() -> anyhow::Result<()> {
                 println!("no sightings recorded for '{word}'");
                 return Ok(());
             }
-            let prompt = item_query::build_prompt(&question, &obs);
+            let candidates = query_candidates(&store, &obs, None, Duration::seconds(10), 200)
+                .unwrap_or_else(|error| {
+                    eprintln!("cover evidence unavailable: {error}");
+                    Vec::new()
+                });
+            let prompt = build_prompt_with_candidates(&question, &obs, &candidates);
             match (
                 std::env::var("ITEM_VLM_BASE_URL"),
                 std::env::var("ITEM_VLM_MODEL"),
             ) {
                 (Ok(base), Ok(model)) => {
                     let client = VlmClient::new(base, model);
-                    println!("{}", client.ask(&prompt).await?);
+                    match client.ask(&prompt).await {
+                        Ok(answer) => println!("{answer}"),
+                        Err(error) => {
+                            eprintln!("VLM unavailable: {error}; using deterministic evidence");
+                            print_direct_answer(&obs);
+                            print_candidates(&candidates);
+                        }
+                    }
                 }
                 _ => {
-                    println!(
-                        "(set ITEM_VLM_BASE_URL / ITEM_VLM_MODEL to answer via VLM; raw log below)"
-                    );
-                    print_rows(&obs);
+                    print_direct_answer(&obs);
+                    print_candidates(&candidates);
                 }
             }
         }
     }
     Ok(())
+}
+
+fn query_candidates(
+    store: &Store,
+    observations: &[item_core::Observation],
+    camera: Option<&str>,
+    window: Duration,
+    limit: i64,
+) -> anyhow::Result<Vec<Candidate>> {
+    let mut candidates = Vec::new();
+    for observation in observations {
+        if camera.is_some_and(|camera| camera != observation.camera_id) {
+            continue;
+        }
+        // Anchor the event window to the recorded target last hit, not now.
+        // Include the later missed-gap sweep and closed cover geometry.
+        let since = observation.last_seen - window;
+        let until = observation.last_seen + window.max(Duration::seconds(31));
+        let events = store.scene_events_for_camera(&observation.camera_id, since, until, limit)?;
+        for candidate in find_candidates(&events, &observation.label, window) {
+            if candidate.target_observation_id == observation.id {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.target_event_id.cmp(&right.target_event_id))
+            .then_with(|| left.cover_event_id.cmp(&right.cover_event_id))
+    });
+    candidates.dedup_by_key(|candidate| (candidate.target_event_id, candidate.cover_event_id));
+    Ok(candidates)
+}
+
+fn print_direct_answer(obs: &[item_core::Observation]) {
+    if let Some(observation) = obs.first() {
+        println!(
+            "{} was last directly seen at {}/{} on {} UTC.",
+            observation.label,
+            observation.camera_id,
+            observation.zone,
+            observation.last_seen.format("%Y-%m-%d %H:%M:%S"),
+        );
+    }
+}
+
+fn print_candidates(candidates: &[Candidate]) {
+    for candidate in candidates {
+        println!(
+            "Hypothesis: {} -> {} ({}, heuristic score {:.2}): {}",
+            candidate.target_label,
+            candidate.cover_label,
+            candidate.relation,
+            candidate.score,
+            candidate.explanation
+        );
+    }
 }
 
 fn print_rows(obs: &[item_core::Observation]) {

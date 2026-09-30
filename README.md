@@ -32,7 +32,8 @@ Crates, one-way dependencies (`item-ingest`/`item-query`/`item-web` -> `item-cor
   resident daemon (`--daemon --config`, see below) that drives every configured
   camera at once, publishes a health snapshot, and keeps its own database and
   snapshot directory bounded.
-- **crates/item-query** — the read side. CLI (`log`, `ask`) over observations,
+- **crates/item-query** — the read side. CLI (`log`, `ask`, `candidates`) over
+  observations and conservative 2-D cover hypotheses,
   with an OpenAI-compatible VLM client (llama.cpp/Ollama/cloud sidecar) used
   only when `ITEM_VLM_BASE_URL`/`ITEM_VLM_MODEL` are set. The Rust core never
   embeds a VLM.
@@ -179,10 +180,11 @@ which is what makes them comparable with the row's own `hit_count` and its
 disappearance is never read across a restart boundary. On shutdown every still-open key
 is closed first — otherwise the last real disappearance of a run would be lost.
 
-**This file is an observation, not the truth.** It exists to gather real evidence for
-the data-model v2 events table (see the roadmap); nothing reads it back as state.
-`webhook`-fed cameras produce no events: Frigate sends discrete events with no
-continuous frames, so a disappearance can never be observed there.
+**JSONL is an operational/debug mirror, not authoritative state.** G1 now persists
+lifecycle facts in SQLite's `observation_events`, with source and noticed timestamps,
+session/reason metadata, and optional immutable event-boundary geometry. Query rules
+read those rows, not JSONL. Frigate webhooks persist discrete `appeared` facts (and
+geometry when supplied), but cannot observe a continuous-frame disappearance.
 
 ### Keeping it bounded (`--maintenance`)
 
@@ -316,9 +318,10 @@ auto-read as pixels), and everything downstream — NMS, zone mapping, dedup,
 snapshot burn-in with highlight — is unchanged. Labels are whatever you ask
 for via `--targets` (household defaults: remote, keys, scissors, charger, …;
 empty string = "list everything visible"), reusing
-`ITEM_VLM_BASE_URL`/`ITEM_VLM_MODEL` from the ask bar. Caveats: VLMs give no
-calibrated confidence (a `score` field is used when present, else 1.0), and
-one detection = one HTTP round trip against a local LLM — the loop therefore
+`ITEM_VLM_BASE_URL`/`ITEM_VLM_MODEL` from the ask bar. Caveats: VLMs do not
+provide calibrated detection confidence; an optional `score` is only carried
+through as an input signal (otherwise it defaults to 1.0), not an accuracy
+claim. One detection = one HTTP round trip against a local LLM — the loop therefore
 defaults to `--detect-fps 0.2` and skips frames (never dies) while the
 sidecar is down.
 
@@ -338,10 +341,11 @@ commands: [docs/vlm-sidecar.md](docs/vlm-sidecar.md).
 The flagship target: answer "where are my keys?" even when they are no longer
 visible. Evidence pattern on a single fixed camera: an object disappears from
 detections while a covering/container object appears at its last-seen spot.
-"Occluded by the box" and "inside the box" are indistinguishable to one
-viewpoint and produce the same actionable answer, so one
-disappearance/coverage rule covers both — stated probabilistically ("likely
-in/under the box, now on the shelf"), never as fact. Building blocks, in order:
+A single viewpoint and overlapping 2-D boxes cannot establish "inside the box".
+The implemented rules offer only `possibly_occluded_by` / `possibly_under`
+visibility hypotheses; containment additionally needs size, usable interior,
+and affordance evidence. Scores rank candidates, not calibrated probabilities.
+Building blocks, in order:
 
 1. **Resident ingest** (prerequisite, not optional): the disappearance moment
    and the covering event are temporal facts only continuous observation
@@ -353,16 +357,37 @@ in/under the box, now on the shelf"), never as fact. Building blocks, in order:
    templates), each with a real-hardware verification pass; the known gaps are
    listed in §9 of that document (chiefly: Linux/macOS service installs are
    template-level only).
-2. **Data model v2**: persist per-observation bboxes (the DB currently stores
-   zone + a burned-in snapshot only, no coordinates) and an events table
-   (appeared / disappeared / covered / moved).
-3. **Query-side rule engine** (item-query): match disappearances to coverage
-   events; transitive tracking through containers (once contained, the
-   container's position IS the item's position — box moves, the answer
-   follows); optional open-lid verification by asking the VLM "is X in the
-   box?" when it is visible.
-4. **WebUI evidence cards**: last-seen snapshot -> covering-event snapshot ->
-   inference with explicit confidence.
+2. **G1 — data model v2: landed.** SQLite schema v2 adds
+   `observation_geometry`, `observation_events`, and `depth_evidence`.
+   Geometry is bounded to first/last samples plus immutable event-boundary
+   copies, not raw per-frame detections. Lifecycle facts are `appeared` /
+   `disappeared`; `covered` / `contained` remain derived claims, not detector
+   events. [docs/geometry-containment.md](docs/geometry-containment.md) separates
+   this implementation from the remaining design contract.
+3. **G2 — conservative 2-D candidates/CLI: landed.** `item-query candidates`
+   matches missed-gap disappearances to persistent overlapping covers in the
+   same camera, zone, and ingest session, with timing and geometry checks.
+   It emits `possibly_occluded_by` / `possibly_under`, explanations, evidence
+   ids, and heuristic scores. CLI `ask` keeps the direct last sighting first;
+   VLM wording is optional and is not a guarantee of accuracy.
+4. **G3 — optional relative-depth provider: landed.** `item-ingest` exposes a
+   provider interface and an OpenAI-compatible ordinal VLM backend behind
+   `--features relative-depth`. Depth is optional and provenance-bearing;
+   comparable same-frame/provider-response ordering can support or conflict
+   with a cover candidate. Missing or incomparable evidence stays `unknown`.
+   This is not metric depth or validated containment accuracy.
+5. **G4/G5 — future.** Size intervals, usable-interior/affordance reasoning,
+   containment hypotheses, and query/WebUI evidence cards remain planned.
+   Any future moved-with/container tracking or open-lid VLM checks must remain
+   qualified hypotheses with auditable evidence, never an automatic transfer
+   of an item's observed position to a container.
+
+```sh
+cargo run -p item-query -- --db data/items.db candidates keys --camera desk --window-secs 120 --json
+```
+
+The command reads lifecycle evidence already written by ingest; it does not
+create a containment record or persist a new inference.
 
 Identity stays cheap: position-continuity + label association for large
 static containers, manual naming in the WebUI over automatic re-ID (no
@@ -389,9 +414,10 @@ spot, and transient occluders (people) vs persistent ones must be told apart
   burned in with that frame's surviving detection boxes (label-colored,
   "label conf" chip via the embedded 8x8 font) and gray dashed zone rects;
   the new row's OWN box is highlighted (thicker stroke + white ring) --
-  per-row rendering, so same-frame births get distinct files. Pixels only,
-  the DB never stores boxes; the Frigate webhook path keeps storing
-  `frigate://` refs instead.
+  per-row rendering, so same-frame births get distinct files. SQLite stores
+  bounded first/last geometry plus immutable event-boundary geometry in
+  `observation_geometry`; it does not store raw per-frame boxes. The Frigate
+  webhook path keeps storing `frigate://` refs when no image is available.
 - Detection runs at `--detect-fps` (default 1; 720p CPU inference measured
   ~280ms/frame at quality 60) while decode runs at stream rate; a person
   lingering in one zone yields ONE merged observation with a hit count, not

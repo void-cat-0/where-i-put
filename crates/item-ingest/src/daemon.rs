@@ -607,6 +607,7 @@ mod tests {
                 height: 8,
             }),
             detector: DetectorSpec::Null,
+            depth: crate::runtime::DepthSpec::None,
             detect_fps: 1.0,
             snapshot_dir: std::path::PathBuf::from("unused"),
             events_path: None,

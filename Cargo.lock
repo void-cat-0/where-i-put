@@ -1537,6 +1537,7 @@ dependencies = [
  "nokhwa",
  "ort",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror",
@@ -1557,6 +1558,7 @@ dependencies = [
  "item-core",
  "reqwest",
  "serde",
+ "serde_json",
  "tokio",
 ]
 

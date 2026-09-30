@@ -68,6 +68,8 @@ pub mod defaults {
     pub const CONF: f32 = 0.3;
     pub const VLM_TIMEOUT_SECS: u64 = 60;
     pub const VLM_COORDS: &str = "norm1000";
+    pub const DEPTH_PROVIDER: &str = "none";
+    pub const DEPTH_TIMEOUT_SECS: u64 = 30;
     pub const CHECKPOINT_SECS: u64 = 300;
     /// How long an observation is kept after its `last_seen`. **Read the hard
     /// constraint in `item-ingest::retention` before lowering this**: the v2
@@ -145,6 +147,15 @@ pub struct CameraConfig {
     /// Vocabulary for `detector = "vlm"`.
     #[serde(default)]
     pub targets: Option<String>,
+    /// Optional ordinal depth provider: `none` or `relative-vlm`.
+    #[serde(default)]
+    pub depth_provider: Option<String>,
+    #[serde(default)]
+    pub depth_base_url: Option<String>,
+    #[serde(default)]
+    pub depth_model: Option<String>,
+    #[serde(default)]
+    pub depth_timeout: Option<u64>,
     /// name -> [x0, y0, x1, y1] in camera pixels; first match wins (BTreeMap
     /// order is alphabetical, so name zones deliberately if they overlap).
     #[serde(default)]
@@ -163,6 +174,8 @@ pub enum ConfigError {
     },
     #[error("store: {0}")]
     Store(#[from] item_core::store::StoreError),
+    #[error("invalid configuration: {0}")]
+    Invalid(String),
 }
 
 impl Config {
@@ -209,10 +222,15 @@ impl Config {
                     })
                     .or_else(|| cam.webcam.map(|index| SourceSpec::Webcam { index })),
                 detector: settings.detector_spec_for(Some(cam)),
+                // `main` validates every task before opening the daemon. Keep
+                // this historical shape for daemon callers, but never turn an
+                // invalid provider into `None` or silently disable it.
+                depth: settings
+                    .depth_spec_for(Some(cam))
+                    .expect("depth configuration must be validated before camera_tasks"),
                 detect_fps: settings.detect_fps_for(Some(cam)),
                 snapshot_dir: PathBuf::from(&settings.snapshots_dir),
                 events_path: settings.events_path(),
-                // The daemon runs until it is asked to stop.
                 max_frames: 0,
                 enabled: true,
             })
@@ -238,6 +256,10 @@ pub struct CliOverrides {
     pub vlm_timeout: Option<u64>,
     pub vlm_coords: Option<String>,
     pub targets: Option<String>,
+    pub depth_provider: Option<String>,
+    pub depth_base_url: Option<String>,
+    pub depth_model: Option<String>,
+    pub depth_timeout: Option<u64>,
     pub preview_url: Option<String>,
 }
 
@@ -247,6 +269,8 @@ pub struct CliOverrides {
 pub struct EnvOverrides {
     pub vlm_base_url: Option<String>,
     pub vlm_model: Option<String>,
+    pub depth_base_url: Option<String>,
+    pub depth_model: Option<String>,
 }
 
 impl EnvOverrides {
@@ -254,6 +278,14 @@ impl EnvOverrides {
         Self {
             vlm_base_url: std::env::var("ITEM_VLM_BASE_URL").ok(),
             vlm_model: std::env::var("ITEM_VLM_MODEL").ok(),
+            // ITEM_VLM_* is a compatibility fallback for the depth backend;
+            // depth_spec_for only consumes it when relative-vlm is enabled.
+            depth_base_url: std::env::var("ITEM_DEPTH_BASE_URL")
+                .ok()
+                .or_else(|| std::env::var("ITEM_VLM_BASE_URL").ok()),
+            depth_model: std::env::var("ITEM_DEPTH_MODEL")
+                .ok()
+                .or_else(|| std::env::var("ITEM_VLM_MODEL").ok()),
         }
     }
 }
@@ -284,6 +316,16 @@ pub struct RuntimeConfig {
     /// `None` = derive from [`RuntimeConfig::detect_fps`].
     pub detect_fps: Option<f64>,
     pub targets: String,
+    pub depth_provider: String,
+    pub depth_base_url: Option<String>,
+    pub depth_model: Option<String>,
+    pub depth_timeout: u64,
+    depth_provider_cli: bool,
+    depth_base_url_cli: bool,
+    depth_model_cli: bool,
+    depth_timeout_cli: bool,
+    depth_base_url_env: bool,
+    depth_model_env: bool,
     pub model: String,
     pub input_size: usize,
     pub conf: f32,
@@ -294,6 +336,18 @@ pub struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Validate provider names and values before any database or camera work.
+    pub fn validate(&self, file: Option<&Config>) -> Result<(), String> {
+        self.depth_spec_for(None).map_err(|e| e.to_string())?;
+        if let Some(file) = file {
+            for camera in &file.camera {
+                self.depth_spec_for(Some(camera))
+                    .map_err(|e| format!("camera '{}': {e}", camera.id))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Merge the four layers. See the module doc for the precedence.
     ///
     /// `camera_id` deliberately does **not** come from config.toml: it is the
@@ -308,6 +362,25 @@ impl RuntimeConfig {
             .camera_id
             .as_deref()
             .and_then(|id| file.and_then(|c| c.camera.iter().find(|cam| cam.id == id)));
+        // CLI values are global explicit overrides: a camera row must not undo
+        // them. Environment is only the fallback layer for depth endpoints.
+        let depth_provider_cli = cli.depth_provider.is_some();
+        let depth_base_url_cli = cli.depth_base_url.is_some();
+        let depth_model_cli = cli.depth_model.is_some();
+        let depth_timeout_cli = cli.depth_timeout.is_some();
+        let depth_provider_for_env = cli
+            .depth_provider
+            .as_deref()
+            .or_else(|| row.and_then(|camera| camera.depth_provider.as_deref()))
+            .unwrap_or(defaults::DEPTH_PROVIDER);
+        let depth_env_base_url = env.depth_base_url.clone().or_else(|| {
+            (depth_provider_for_env == "relative-vlm").then(|| env.vlm_base_url.clone())?
+        });
+        let depth_env_model = env.depth_model.clone().or_else(|| {
+            (depth_provider_for_env == "relative-vlm").then(|| env.vlm_model.clone())?
+        });
+        let depth_base_url_env = depth_env_base_url.is_some();
+        let depth_model_env = depth_env_model.is_some();
 
         Self {
             db: take(&cli.db, daemon.and_then(|d| d.db.as_deref()), defaults::DB),
@@ -362,6 +435,31 @@ impl RuntimeConfig {
                 row.and_then(|c| c.targets.as_deref()),
                 default_targets(),
             ),
+            depth_provider: take(
+                &cli.depth_provider,
+                row.and_then(|c| c.depth_provider.as_deref()),
+                defaults::DEPTH_PROVIDER,
+            ),
+            depth_base_url: cli
+                .depth_base_url
+                .clone()
+                .or_else(|| depth_env_base_url.clone())
+                .or_else(|| row.and_then(|c| c.depth_base_url.clone())),
+            depth_model: cli
+                .depth_model
+                .clone()
+                .or_else(|| depth_env_model.clone())
+                .or_else(|| row.and_then(|c| c.depth_model.clone())),
+            depth_timeout: cli
+                .depth_timeout
+                .or_else(|| row.and_then(|c| c.depth_timeout))
+                .unwrap_or(defaults::DEPTH_TIMEOUT_SECS),
+            depth_provider_cli,
+            depth_base_url_cli,
+            depth_model_cli,
+            depth_timeout_cli,
+            depth_base_url_env,
+            depth_model_env,
             model: cli
                 .model
                 .clone()
@@ -433,6 +531,63 @@ impl RuntimeConfig {
                 input_size: self.input_size,
                 conf: self.conf,
             },
+        }
+    }
+
+    pub fn depth_spec_for(
+        &self,
+        row: Option<&CameraConfig>,
+    ) -> std::result::Result<crate::runtime::DepthSpec, String> {
+        let provider = if self.depth_provider_cli {
+            self.depth_provider.as_str()
+        } else {
+            row.and_then(|c| c.depth_provider.as_deref())
+                .unwrap_or(self.depth_provider.as_str())
+        };
+        match provider {
+            "none" | "" => Ok(crate::runtime::DepthSpec::None),
+            "relative-vlm" => {
+                // CLI > environment > camera file > default. The resolved
+                // values already include CLI/env layers; only consult a row
+                // when neither explicit layer supplied a value.
+                let base_url = if self.depth_base_url_cli || self.depth_base_url_env {
+                    self.depth_base_url.clone()
+                } else {
+                    row.and_then(|c| c.depth_base_url.clone())
+                        .or_else(|| self.depth_base_url.clone())
+                }
+                .unwrap_or_default();
+                let model = if self.depth_model_cli || self.depth_model_env {
+                    self.depth_model.clone()
+                } else {
+                    row.and_then(|c| c.depth_model.clone())
+                        .or_else(|| self.depth_model.clone())
+                }
+                .unwrap_or_default();
+                let timeout = if self.depth_timeout_cli {
+                    self.depth_timeout
+                } else {
+                    row.and_then(|c| c.depth_timeout)
+                        .unwrap_or(self.depth_timeout)
+                };
+                if timeout == 0 {
+                    return Err("depth timeout must be greater than zero".into());
+                }
+                if base_url.trim().is_empty() {
+                    return Err("relative-vlm depth requires a non-empty base URL".into());
+                }
+                if model.trim().is_empty() {
+                    return Err("relative-vlm depth requires a non-empty model".into());
+                }
+                Ok(crate::runtime::DepthSpec::RelativeVlm {
+                    base_url,
+                    model,
+                    timeout: Duration::from_secs(timeout),
+                })
+            }
+            other => Err(format!(
+                "unknown depth provider '{other}' (none|relative-vlm)"
+            )),
         }
     }
 
@@ -846,6 +1001,8 @@ id = "fed-by-frigate"
         let env = EnvOverrides {
             vlm_base_url: Some("http://from-env/v1".into()),
             vlm_model: Some("from-env-model".into()),
+            depth_base_url: None,
+            depth_model: None,
         };
         let cfg = RuntimeConfig::resolve(None, &cli(), &env);
         assert_eq!(cfg.vlm_base_url.as_deref(), Some("http://from-env/v1"));
@@ -876,6 +1033,64 @@ id = "fed-by-frigate"
         };
         let cfg = RuntimeConfig::resolve(None, &cli, &EnvOverrides::default());
         assert_eq!(cfg.detect_fps(), 1.0);
+    }
+
+    #[test]
+    fn depth_cli_beats_environment_and_camera_file() {
+        let file = parse(
+            r#"
+[[camera]]
+id = "cam"
+depth_provider = "relative-vlm"
+depth_base_url = "http://file/v1"
+depth_model = "file-model"
+depth_timeout = 10
+"#,
+        );
+        let cli = CliOverrides {
+            camera_id: Some("cam".into()),
+            depth_provider: Some("relative-vlm".into()),
+            depth_base_url: Some("http://cli/v1".into()),
+            depth_model: Some("cli-model".into()),
+            depth_timeout: Some(7),
+            ..Default::default()
+        };
+        let env = EnvOverrides {
+            depth_base_url: Some("http://env/v1".into()),
+            depth_model: Some("env-model".into()),
+            ..Default::default()
+        };
+        let settings = RuntimeConfig::resolve(Some(&file), &cli, &env);
+        assert!(matches!(
+            settings.depth_spec_for(Some(&file.camera[0])).unwrap(),
+            crate::runtime::DepthSpec::RelativeVlm { base_url, model, timeout }
+                if base_url == "http://cli/v1" && model == "cli-model" && timeout == Duration::from_secs(7)
+        ));
+    }
+
+    #[test]
+    fn unknown_depth_provider_and_zero_timeout_fail_validation() {
+        let file = parse(
+            r#"
+[[camera]]
+id = "cam"
+depth_provider = "made-up"
+"#,
+        );
+        let settings = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        assert!(settings.validate(Some(&file)).is_err());
+        let file = parse(
+            r#"
+[[camera]]
+id = "cam"
+depth_provider = "relative-vlm"
+depth_base_url = "http://127.0.0.1/v1"
+depth_model = "m"
+depth_timeout = 0
+"#,
+        );
+        let settings = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        assert!(settings.validate(Some(&file)).is_err());
     }
 
     #[test]

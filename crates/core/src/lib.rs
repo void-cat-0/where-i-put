@@ -7,4 +7,7 @@ pub mod geo;
 pub mod model;
 pub mod store;
 
-pub use model::{Detection, FrameMeta, Observation, Region, Trajectory};
+pub use model::{
+    DepthEvidence, DepthInput, Detection, FrameMeta, GeometryInput, Observation, ObservationEvent,
+    ObservationEventInput, ObservationGeometry, Region, SceneEvent, SightingInput, Trajectory,
+};

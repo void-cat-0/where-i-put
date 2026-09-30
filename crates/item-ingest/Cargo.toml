@@ -70,9 +70,13 @@ optional = true
 version = "0.3"
 optional = true
 
+[dev-dependencies]
+rusqlite.workspace = true
+
 [features]
 default = []
 yolo = ["dep:ort"]
 camera = ["dep:nokhwa"]
 rtsp = ["dep:ffmpeg-next", "dep:tokio-stream", "dep:futures-util"]
 vlm = ["dep:reqwest", "dep:base64"]
+relative-depth = ["dep:reqwest", "dep:base64"]

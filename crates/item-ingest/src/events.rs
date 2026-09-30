@@ -85,6 +85,22 @@ pub struct Event {
     pub hits: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seen_for_s: Option<f64>,
+    /// Exact source-frame geometry and lifecycle metadata used by SQLite G1.
+    /// These fields stay out of the legacy JSONL shape for compatibility.
+    #[serde(skip)]
+    pub occurred_at: DateTime<Utc>,
+    #[serde(skip)]
+    pub noticed_at: DateTime<Utc>,
+    #[serde(skip)]
+    pub reason: String,
+    #[serde(skip)]
+    pub geometry_id: Option<i64>,
+    #[serde(skip)]
+    pub bbox: Option<[f32; 4]>,
+    #[serde(skip)]
+    pub frame_width: Option<u32>,
+    #[serde(skip)]
+    pub frame_height: Option<u32>,
 }
 
 impl Event {
@@ -100,6 +116,13 @@ impl Event {
             event: event.to_string(),
             hits: 0,
             seen_for_s: None,
+            occurred_at: ts,
+            noticed_at: ts,
+            reason: "marker".into(),
+            geometry_id: None,
+            bbox: None,
+            frame_width: None,
+            frame_height: None,
         }
     }
 
@@ -120,6 +143,13 @@ impl Event {
             event: APPEARED.to_string(),
             hits,
             seen_for_s: None,
+            occurred_at: ts,
+            noticed_at: ts,
+            reason: "appeared".into(),
+            geometry_id: None,
+            bbox: None,
+            frame_width: None,
+            frame_height: None,
         }
     }
 
@@ -143,6 +173,16 @@ impl Event {
             // The same rounding the health file applies before writing a
             // measured millisecond value: one decimal, no float noise.
             seen_for_s: Some((seen_for.as_secs_f64() * 10.0).round() / 10.0),
+            // The legacy constructor represents a synthetic event whose last
+            // hit and noticed time are the same; Tracker replaces these with
+            // the real values before persistence.
+            occurred_at: ts,
+            noticed_at: ts,
+            reason: "missed_gap".into(),
+            geometry_id: None,
+            bbox: None,
+            frame_width: None,
+            frame_height: None,
         }
     }
 
@@ -304,6 +344,10 @@ pub struct Sighting<'a> {
     pub is_new: bool,
     /// The row's hit count as of this sighting.
     pub hits: i64,
+    pub bbox: [f32; 4],
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub geometry_id: i64,
 }
 
 /// What the in-memory table knew about one key: the observation it currently
@@ -322,6 +366,10 @@ struct Tracked {
     first_hit_at: DateTime<Utc>,
     last_hit_at: DateTime<Utc>,
     hits_at_last_hit: i64,
+    geometry_id: i64,
+    bbox: [f32; 4],
+    frame_width: u32,
+    frame_height: u32,
 }
 
 /// The per-camera in-memory timeline (§6).
@@ -382,8 +430,12 @@ impl Tracker {
             zone,
             label,
             obs_id,
-            is_new,
+            is_new: _,
             hits,
+            bbox,
+            frame_width,
+            frame_height,
+            geometry_id,
         } = *sighting;
         let key = (camera_id.to_string(), zone.to_string(), label.to_string());
         let mut events = Vec::new();
@@ -394,9 +446,11 @@ impl Tracker {
             // §6's drift case: the store opened a different row under a key we
             // were already tracking (the dedup window's edge, or a row deleted
             // by hand). We cannot know whether the old object left or was
-            // merely renamed, so report both facts rather than inventing a
+            // merely renamed, so report both facts rather than invent a
             // merge.
-            events.push(self.disappearance(&key, previous, now));
+            let mut departure = self.disappearance(&key, previous, now, "row_changed");
+            departure.reason = "row_changed".into();
+            events.push(departure);
         }
 
         let appeared = self.entries.get(&key).map(|previous| previous.obs_id) != Some(obs_id);
@@ -413,14 +467,19 @@ impl Tracker {
                 first_hit_at,
                 last_hit_at: now,
                 hits_at_last_hit: hits,
+                geometry_id,
+                bbox,
+                frame_width,
+                frame_height,
             },
         );
         if appeared {
-            debug_assert!(
-                is_new || events.len() == 2,
-                "an arrival on a known key is an id change"
-            );
-            events.push(Event::appeared(now, &key.0, &key.1, &key.2, obs_id, hits));
+            let mut arrival = Event::appeared(now, &key.0, &key.1, &key.2, obs_id, hits);
+            arrival.geometry_id = Some(geometry_id);
+            arrival.bbox = Some(bbox);
+            arrival.frame_width = Some(frame_width);
+            arrival.frame_height = Some(frame_height);
+            events.push(arrival);
         }
         events
     }
@@ -438,7 +497,7 @@ impl Tracker {
             })
             .map(|(key, _)| key.clone())
             .collect();
-        self.close(stale, now)
+        self.close(stale, now, "missed_gap")
     }
 
     /// Close **every** open key, gap or not.
@@ -449,17 +508,22 @@ impl Tracker {
     /// run would be silently lost.
     pub fn flush_all(&mut self, now: DateTime<Utc>) -> Vec<Event> {
         let all: Vec<(String, String, String)> = self.entries.keys().cloned().collect();
-        self.close(all, now)
+        self.close(all, now, "shutdown")
     }
 
     /// Remove `keys` from the table and report each as a disappearance.
-    fn close(&mut self, keys: Vec<(String, String, String)>, now: DateTime<Utc>) -> Vec<Event> {
+    fn close(
+        &mut self,
+        keys: Vec<(String, String, String)>,
+        now: DateTime<Utc>,
+        reason: &str,
+    ) -> Vec<Event> {
         let mut events = Vec::with_capacity(keys.len());
         for key in keys {
             let Some(tracked) = self.entries.remove(&key) else {
                 continue;
             };
-            events.push(self.disappearance(&key, &tracked, now));
+            events.push(self.disappearance(&key, &tracked, now, reason));
         }
         events
     }
@@ -469,6 +533,7 @@ impl Tracker {
         key: &(String, String, String),
         tracked: &Tracked,
         now: DateTime<Utc>,
+        reason: &str,
     ) -> Event {
         // The event's timestamp is when the absence was *noticed* (`now`, the
         // sweep). `seen_for_s` is how long the object was actually observed:
@@ -479,7 +544,7 @@ impl Tracker {
             .signed_duration_since(tracked.first_hit_at)
             .to_std()
             .unwrap_or_default();
-        Event::disappeared(
+        let mut event = Event::disappeared(
             now,
             &key.0,
             &key.1,
@@ -487,7 +552,15 @@ impl Tracker {
             tracked.obs_id,
             tracked.hits_at_last_hit,
             seen_for,
-        )
+        );
+        event.occurred_at = tracked.last_hit_at;
+        event.noticed_at = now;
+        event.reason = reason.to_string();
+        event.geometry_id = Some(tracked.geometry_id);
+        event.bbox = Some(tracked.bbox);
+        event.frame_width = Some(tracked.frame_width);
+        event.frame_height = Some(tracked.frame_height);
+        event
     }
 }
 
@@ -529,6 +602,10 @@ mod tests {
             obs_id,
             is_new,
             hits,
+            bbox: [10.0, 10.0, 20.0, 20.0],
+            frame_width: 100,
+            frame_height: 100,
+            geometry_id: obs_id,
         }
     }
 

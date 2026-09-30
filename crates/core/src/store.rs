@@ -11,7 +11,10 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-use crate::model::{Observation, Region};
+use crate::model::{
+    DepthEvidence, DepthInput, GeometryInput, Observation, ObservationEvent, ObservationEventInput,
+    ObservationGeometry, Region, SightingInput,
+};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -26,6 +29,10 @@ pub enum StoreError {
     /// the caller an error rather than a panic.
     #[error("dedup window {0:?} is out of range")]
     Window(Duration),
+    #[error("unsupported database schema version {0}; this binary supports up to version 2")]
+    SchemaVersion(i64),
+    #[error("invalid persistence input: {0}")]
+    InvalidInput(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -59,6 +66,7 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", true)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         Self::migrate(&conn)?;
         Ok(Self { conn })
@@ -66,6 +74,7 @@ impl Store {
 
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        conn.pragma_update(None, "foreign_keys", true)?;
         Self::migrate(&conn)?;
         Ok(Self { conn })
     }
@@ -80,6 +89,7 @@ impl Store {
     /// role this mode exists to avoid (`item-web`).
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.pragma_update(None, "foreign_keys", true)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         Ok(Self { conn })
     }
@@ -103,7 +113,12 @@ impl Store {
     }
 
     fn migrate(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > 2 {
+            return Err(StoreError::SchemaVersion(version));
+        }
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS regions (
                  id         INTEGER PRIMARY KEY,
                  camera_id  TEXT NOT NULL,
@@ -125,9 +140,95 @@ impl Store {
                  ON observations (label, zone, camera_id, last_seen DESC);
              -- The retention sweep deletes by `last_seen` alone, which the
              -- lookup index above cannot serve (label is its leading column).
-             CREATE INDEX IF NOT EXISTS idx_obs_last_seen
-                 ON observations (last_seen);",
+                 CREATE INDEX IF NOT EXISTS idx_obs_last_seen
+                     ON observations (last_seen);
+                 CREATE TABLE IF NOT EXISTS observation_geometry (
+                     id              INTEGER PRIMARY KEY,
+                     observation_id  INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+                     sample_kind     TEXT NOT NULL,
+                     captured_at     TEXT NOT NULL,
+                     x0              REAL NOT NULL,
+                     y0              REAL NOT NULL,
+                     x1              REAL NOT NULL,
+                     y1              REAL NOT NULL,
+                     frame_width     INTEGER,
+                     frame_height    INTEGER,
+                     zone            TEXT NOT NULL,
+                     source          TEXT NOT NULL,
+                     confidence      REAL,
+                     snapshot_ref    TEXT,
+                     UNIQUE(observation_id, sample_kind)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_geometry_camera_time
+                     ON observation_geometry (captured_at, observation_id);
+                 CREATE TABLE IF NOT EXISTS observation_events (
+                     id              INTEGER PRIMARY KEY,
+                     observation_id  INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+                     camera_id       TEXT NOT NULL,
+                     zone            TEXT NOT NULL,
+                     label           TEXT NOT NULL,
+                     event_type      TEXT NOT NULL,
+                     occurred_at     TEXT NOT NULL,
+                     noticed_at      TEXT NOT NULL,
+                     source          TEXT NOT NULL,
+                     session_id      TEXT,
+                     reason          TEXT NOT NULL,
+                     hits            INTEGER NOT NULL,
+                     seen_for_s      REAL,
+                     geometry_id     INTEGER REFERENCES observation_geometry(id) ON DELETE SET NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_events_camera_time
+                     ON observation_events (camera_id, occurred_at);
+                 CREATE TABLE IF NOT EXISTS depth_evidence (
+                     id                INTEGER PRIMARY KEY,
+                     geometry_id       INTEGER NOT NULL REFERENCES observation_geometry(id) ON DELETE CASCADE,
+                     provider          TEXT NOT NULL,
+                     frame_id          TEXT NOT NULL DEFAULT '',
+                     response_id       TEXT NOT NULL DEFAULT '',
+                     prompt_version    TEXT NOT NULL DEFAULT '',
+                     backend_version   TEXT NOT NULL DEFAULT '',
+                     mode              TEXT NOT NULL,
+                     relation_to_camera TEXT NOT NULL,
+                     relative_score   REAL,
+                     quality           TEXT NOT NULL,
+                     model_ref         TEXT,
+                     value_m           REAL,
+                     uncertainty_m     REAL,
+                     valid_fraction    REAL,
+                     coordinate_frame TEXT,
+                     calibration_ref   TEXT
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_depth_geometry
+                     ON depth_evidence (geometry_id);",
         )?;
+        let columns = tx
+            .prepare("PRAGMA table_info(depth_evidence)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (name, sql) in [
+            (
+                "frame_id",
+                "ALTER TABLE depth_evidence ADD COLUMN frame_id TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "response_id",
+                "ALTER TABLE depth_evidence ADD COLUMN response_id TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "prompt_version",
+                "ALTER TABLE depth_evidence ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "backend_version",
+                "ALTER TABLE depth_evidence ADD COLUMN backend_version TEXT NOT NULL DEFAULT ''",
+            ),
+        ] {
+            if !columns.iter().any(|column| column == name) {
+                tx.execute(sql, [])?;
+            }
+        }
+        tx.pragma_update(None, "user_version", 2i64)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -249,6 +350,111 @@ impl Store {
         Ok((self.conn.last_insert_rowid(), true, 1))
     }
 
+    /// Record a sighting, bounded geometry, and optional relative depth as one
+    /// transaction. `first` and `last` remain the only moving samples.
+    pub fn record_sighting_with_geometry(
+        &self,
+        input: &SightingInput,
+    ) -> Result<(i64, bool, i64, Option<i64>)> {
+        self.validate_sighting(input)?;
+        let window = Duration::from_secs(input.window_seconds);
+        let window = chrono::Duration::from_std(window).map_err(|_| StoreError::Window(window))?;
+        let earliest = (input.seen_at - window).to_rfc3339();
+        let latest = (input.seen_at + window).to_rfc3339();
+        let seen = input.seen_at.to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM observations
+                 WHERE camera_id = ?1 AND zone = ?2 AND label = ?3
+                   AND last_seen >= ?4 AND first_seen <= ?5
+                 ORDER BY last_seen DESC LIMIT 1",
+                params![
+                    &input.camera_id,
+                    &input.zone,
+                    &input.label,
+                    earliest,
+                    latest
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let (id, is_new, hits) = if let Some(id) = existing {
+            let hits: i64 = tx.query_row(
+                "UPDATE observations SET last_seen=max(last_seen, ?2),
+                    first_seen=min(first_seen, ?2), hit_count=hit_count+1,
+                    sample_snapshot=COALESCE(sample_snapshot, ?3)
+                 WHERE id=?1 RETURNING hit_count",
+                params![id, seen, &input.snapshot],
+                |r| r.get(0),
+            )?;
+            (id, false, hits)
+        } else {
+            tx.execute(
+                "INSERT INTO observations
+                 (camera_id,zone,label,first_seen,last_seen,hit_count,sample_snapshot)
+                 VALUES (?1,?2,?3,?4,?4,1,?5)",
+                params![
+                    &input.camera_id,
+                    &input.zone,
+                    &input.label,
+                    seen,
+                    &input.snapshot
+                ],
+            )?;
+            (tx.last_insert_rowid(), true, 1)
+        };
+        let mut geometry_id = None;
+        if let Some(geometry) = &input.geometry {
+            self.validate_geometry(geometry)?;
+            if let Some(depth) = &input.depth {
+                validate_depth(depth)?;
+            }
+            let mut samples = vec![geometry.clone()];
+            if geometry.sample_kind == "last" {
+                let mut first = geometry.clone();
+                first.sample_kind = "first".into();
+                samples.insert(0, first);
+            }
+            for sample in &samples {
+                let (sample_id, changed) = upsert_bounded_geometry(
+                    &tx,
+                    id,
+                    sample,
+                    sample.sample_kind == "last" && sample.source == "frigate",
+                )?;
+                if sample.sample_kind == geometry.sample_kind {
+                    geometry_id = Some(sample_id);
+                }
+                if changed
+                    && sample.sample_kind == geometry.sample_kind
+                    && let Some(depth) = &input.depth
+                {
+                    insert_depth(&tx, sample_id, depth)?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok((id, is_new, hits, geometry_id))
+    }
+
+    fn validate_sighting(&self, input: &SightingInput) -> Result<()> {
+        if input.camera_id.is_empty()
+            || input.zone.is_empty()
+            || input.label.is_empty()
+            || input.seen_at.timestamp_nanos_opt().is_none()
+            || input.window_seconds == 0
+        {
+            return Err(StoreError::InvalidInput(
+                "sighting identity/timestamp/window is invalid".into(),
+            ));
+        }
+        if input.depth.is_some() && input.geometry.is_none() {
+            return Err(StoreError::InvalidInput("depth requires geometry".into()));
+        }
+        Ok(())
+    }
+
     /// Attach (or replace) an observation's snapshot path after the fact.
     pub fn set_sample_snapshot(&self, id: i64, path: &str) -> Result<()> {
         self.conn.execute(
@@ -332,6 +538,477 @@ impl Store {
         }
     }
 
+    // ---- geometry and lifecycle evidence -----------------------------------
+
+    /// Insert or update one bounded geometry sample. Prefer the typed input API;
+    /// this argument-heavy form remains for callers compiled against G1's first
+    /// draft.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_geometry(
+        &self,
+        observation_id: i64,
+        sample_kind: &str,
+        captured_at: DateTime<Utc>,
+        bbox: [f32; 4],
+        frame_width: Option<u32>,
+        frame_height: Option<u32>,
+        zone: &str,
+        source: &str,
+        confidence: Option<f32>,
+        snapshot_ref: Option<&str>,
+    ) -> Result<i64> {
+        let input = GeometryInput {
+            sample_kind: sample_kind.to_owned(),
+            captured_at,
+            bbox,
+            frame_width,
+            frame_height,
+            zone: zone.to_owned(),
+            source: source.to_owned(),
+            confidence,
+            snapshot_ref: snapshot_ref.map(str::to_owned),
+        };
+        self.validate_geometry(&input)?;
+        if sample_kind == "first" || sample_kind == "last" {
+            let tx = self.conn.unchecked_transaction()?;
+            let (id, _) = upsert_bounded_geometry(&tx, observation_id, &input, false)?;
+            tx.commit()?;
+            return Ok(id);
+        }
+        if sample_kind == "last" {
+            self.conn.execute(
+                "INSERT INTO observation_geometry
+                     (observation_id, sample_kind, captured_at, x0, y0, x1, y1,
+                      frame_width, frame_height, zone, source, confidence, snapshot_ref)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(observation_id, sample_kind) DO UPDATE SET
+                     captured_at = excluded.captured_at,
+                     x0 = excluded.x0, y0 = excluded.y0,
+                     x1 = excluded.x1, y1 = excluded.y1,
+                     frame_width = excluded.frame_width,
+                     frame_height = excluded.frame_height,
+                     zone = excluded.zone, source = excluded.source,
+                     confidence = excluded.confidence,
+                     snapshot_ref = excluded.snapshot_ref",
+                params![
+                    observation_id,
+                    sample_kind,
+                    captured_at.to_rfc3339(),
+                    bbox[0],
+                    bbox[1],
+                    bbox[2],
+                    bbox[3],
+                    frame_width.map(i64::from),
+                    frame_height.map(i64::from),
+                    zone,
+                    source,
+                    confidence,
+                    snapshot_ref,
+                ],
+            )?;
+        } else {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO observation_geometry
+                     (observation_id, sample_kind, captured_at, x0, y0, x1, y1,
+                      frame_width, frame_height, zone, source, confidence, snapshot_ref)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    observation_id,
+                    sample_kind,
+                    captured_at.to_rfc3339(),
+                    bbox[0],
+                    bbox[1],
+                    bbox[2],
+                    bbox[3],
+                    frame_width.map(i64::from),
+                    frame_height.map(i64::from),
+                    zone,
+                    source,
+                    confidence,
+                    snapshot_ref,
+                ],
+            )?;
+        }
+        Ok(self.conn.query_row(
+            "SELECT id FROM observation_geometry
+             WHERE observation_id = ?1 AND sample_kind = ?2",
+            params![observation_id, sample_kind],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn record_geometry_input(&self, observation_id: i64, input: &GeometryInput) -> Result<i64> {
+        self.record_geometry(
+            observation_id,
+            &input.sample_kind,
+            input.captured_at,
+            input.bbox,
+            input.frame_width,
+            input.frame_height,
+            &input.zone,
+            &input.source,
+            input.confidence,
+            input.snapshot_ref.as_deref(),
+        )
+    }
+
+    fn validate_geometry(&self, input: &GeometryInput) -> Result<()> {
+        let [x0, y0, x1, y1] = input.bbox;
+        if input.sample_kind.is_empty() || !input.captured_at.timestamp_nanos_opt().is_some() {
+            return Err(StoreError::InvalidInput(
+                "geometry kind/timestamp is invalid".into(),
+            ));
+        }
+        if ![x0, y0, x1, y1].iter().all(|value| value.is_finite())
+            || x0 < 0.0
+            || y0 < 0.0
+            || x1 < x0
+            || y1 < y0
+            || input.frame_width == Some(0)
+            || input.frame_height == Some(0)
+            || input.frame_width.is_some_and(|w| x1 > w as f32)
+            || input.frame_height.is_some_and(|h| y1 > h as f32)
+        {
+            return Err(StoreError::InvalidInput(
+                "geometry bbox/frame dimensions are invalid".into(),
+            ));
+        }
+        if input
+            .confidence
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(StoreError::InvalidInput(
+                "geometry confidence is invalid".into(),
+            ));
+        }
+        if input.zone.is_empty() || input.source.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "geometry zone/source must be non-empty".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Copy a geometry sample into an immutable event-boundary sample. The
+    /// caller uses the returned id in the event row; the original `last` sample
+    /// may continue to move without changing historical evidence.
+    pub fn copy_geometry(&self, geometry_id: i64, sample_kind: &str) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        let id = copy_geometry_tx(&tx, geometry_id, sample_kind)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_depth(
+        &self,
+        geometry_id: i64,
+        provider: &str,
+        mode: &str,
+        relation_to_camera: &str,
+        relative_score: Option<f32>,
+        quality: &str,
+        model_ref: Option<&str>,
+    ) -> Result<i64> {
+        if provider.is_empty()
+            || mode != "relative"
+            || !["nearer", "middle", "farther", "unknown"].contains(&relation_to_camera)
+            || !["good", "degraded", "invalid"].contains(&quality)
+            || relative_score
+                .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(StoreError::InvalidInput("relative depth is invalid".into()));
+        }
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM observation_geometry WHERE id = ?1",
+                params![geometry_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StoreError::InvalidInput(
+                "depth geometry does not exist".into(),
+            ));
+        }
+        self.conn.execute(
+            "INSERT INTO depth_evidence
+                 (geometry_id, provider, response_id, mode, relation_to_camera, relative_score,
+                  quality, model_ref)
+             VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7)",
+            params![
+                geometry_id,
+                provider,
+                mode,
+                relation_to_camera,
+                relative_score,
+                quality,
+                model_ref,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Freeze the referenced geometry and append its lifecycle event atomically.
+    /// The copy is immutable even if the source is the moving `last` sample.
+    pub fn freeze_and_append_observation_event(
+        &self,
+        event: &ObservationEventInput,
+    ) -> Result<i64> {
+        validate_event(event)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let geometry_id = if let Some(source_id) = event.geometry_id {
+            let observation_id: i64 = tx
+                .query_row(
+                    "SELECT observation_id FROM observation_geometry WHERE id = ?1",
+                    params![source_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| StoreError::InvalidInput("event geometry does not exist".into()))?;
+            if observation_id != event.observation_id {
+                return Err(StoreError::InvalidInput(
+                    "event geometry belongs to another observation".into(),
+                ));
+            }
+            let suffix: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(id), 0) + 1 FROM observation_geometry",
+                [],
+                |r| r.get(0),
+            )?;
+            let kind = format!(
+                "event_{}_{}_{suffix}",
+                event.event_type,
+                event.occurred_at.timestamp_nanos_opt().unwrap_or_default()
+            );
+            let copied = copy_geometry_tx(&tx, source_id, &kind)?;
+            let source_kind: String = tx.query_row(
+                "SELECT sample_kind FROM observation_geometry WHERE id=?1",
+                params![source_id],
+                |row| row.get(0),
+            )?;
+            if source_kind.starts_with("ingress_last_") {
+                tx.execute(
+                    "DELETE FROM observation_geometry WHERE id=?1",
+                    params![source_id],
+                )?;
+            }
+            copied
+        } else {
+            0
+        };
+        let id = insert_event(&tx, event, (geometry_id != 0).then_some(geometry_id))?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn append_observation_event(&self, event: &ObservationEventInput) -> Result<i64> {
+        validate_event(event)?;
+        let geometry_id = self.validate_event_references(event)?;
+        insert_event(&self.conn, event, geometry_id)
+    }
+
+    fn validate_event_references(&self, event: &ObservationEventInput) -> Result<Option<i64>> {
+        let identity: (String, String, String) = self
+            .conn
+            .query_row(
+                "SELECT camera_id, zone, label FROM observations WHERE id = ?1",
+                params![event.observation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::InvalidInput("event observation does not exist".into()))?;
+        if identity
+            != (
+                event.camera_id.clone(),
+                event.zone.clone(),
+                event.label.clone(),
+            )
+        {
+            return Err(StoreError::InvalidInput(
+                "event identity does not match observation".into(),
+            ));
+        }
+        if let Some(geometry_id) = event.geometry_id {
+            let owner: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT observation_id FROM observation_geometry WHERE id = ?1",
+                    params![geometry_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if owner != Some(event.observation_id) {
+                return Err(StoreError::InvalidInput(
+                    "event geometry does not belong to observation".into(),
+                ));
+            }
+            Ok(Some(geometry_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn geometry_by_id(&self, geometry_id: i64) -> Result<Option<ObservationGeometry>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, observation_id, sample_kind, captured_at,
+                        x0, y0, x1, y1, frame_width, frame_height,
+                        zone, source, confidence, snapshot_ref
+                 FROM observation_geometry WHERE id = ?1",
+                params![geometry_id],
+                geometry_row,
+            )
+            .optional()?)
+    }
+
+    pub fn geometry_for_observation(
+        &self,
+        observation_id: i64,
+    ) -> Result<Vec<ObservationGeometry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, observation_id, sample_kind, captured_at,
+                    x0, y0, x1, y1, frame_width, frame_height,
+                    zone, source, confidence, snapshot_ref
+             FROM observation_geometry
+             WHERE observation_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![observation_id], geometry_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn scene_events(
+        &self,
+        camera_id: Option<&str>,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<crate::model::SceneEvent>> {
+        let events = match camera_id {
+            Some(camera) => self.events_for_camera(camera, since, until, limit)?,
+            None => self.events_between(since, until, limit)?,
+        };
+        events
+            .into_iter()
+            .map(|event| {
+                let geometry = event
+                    .geometry_id
+                    .map(|id| self.geometry_by_id(id))
+                    .transpose()?
+                    .flatten();
+                let depth = geometry
+                    .as_ref()
+                    .map(|g| self.depth_for_geometry(g.id))
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok(crate::model::SceneEvent {
+                    event,
+                    geometry,
+                    depth,
+                })
+            })
+            .collect()
+    }
+
+    pub fn scene_events_for_camera(
+        &self,
+        camera_id: &str,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<crate::model::SceneEvent>> {
+        let events = self.events_for_camera(camera_id, since, until, limit)?;
+        events
+            .into_iter()
+            .map(|event| {
+                let geometry = event
+                    .geometry_id
+                    .map(|id| self.geometry_by_id(id))
+                    .transpose()?
+                    .flatten();
+                let depth = geometry
+                    .as_ref()
+                    .map(|g| self.depth_for_geometry(g.id))
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok(crate::model::SceneEvent {
+                    event,
+                    geometry,
+                    depth,
+                })
+            })
+            .collect()
+    }
+
+    pub fn events_between(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<ObservationEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, observation_id, camera_id, zone, label, event_type,
+                    occurred_at, noticed_at, source, session_id, reason,
+                    hits, seen_for_s, geometry_id
+             FROM observation_events
+             WHERE occurred_at >= ?1 AND occurred_at <= ?2
+             ORDER BY occurred_at ASC, id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                since.to_rfc3339(),
+                until.to_rfc3339(),
+                limit.clamp(1, MAX_LIMIT)
+            ],
+            event_row,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn events_for_camera(
+        &self,
+        camera_id: &str,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<ObservationEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, observation_id, camera_id, zone, label, event_type,
+                    occurred_at, noticed_at, source, session_id, reason,
+                    hits, seen_for_s, geometry_id
+             FROM observation_events
+             WHERE camera_id = ?1 AND occurred_at >= ?2 AND occurred_at <= ?3
+             ORDER BY occurred_at ASC, id ASC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                camera_id,
+                since.to_rfc3339(),
+                until.to_rfc3339(),
+                limit.clamp(1, MAX_LIMIT)
+            ],
+            event_row,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn depth_for_geometry(&self, geometry_id: i64) -> Result<Vec<DepthEvidence>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, geometry_id, provider, frame_id, response_id, prompt_version,
+                    backend_version, mode, relation_to_camera, relative_score, quality,
+                    model_ref, value_m, uncertainty_m, valid_fraction, coordinate_frame,
+                    calibration_ref
+             FROM depth_evidence WHERE geometry_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![geometry_id], depth_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     // ---- retention (docs/resident-ingest.md §7) ---------------------------
 
     /// Delete every observation last seen before `cutoff`, returning the ids
@@ -387,6 +1064,287 @@ impl Store {
         self.conn.execute_batch("VACUUM")?;
         Ok(())
     }
+}
+
+fn validate_depth(input: &DepthInput) -> Result<()> {
+    if input.provider.is_empty()
+        || input.frame_id.is_empty()
+        || input.response_id.is_empty()
+        || input.prompt_version.is_empty()
+        || input.backend_version.is_empty()
+        || input.mode != "relative"
+        || !["nearer", "middle", "farther", "unknown"].contains(&input.relation_to_camera.as_str())
+        || !["good", "degraded", "invalid"].contains(&input.quality.as_str())
+        || input
+            .relative_score
+            .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
+        || input.value_m.is_some()
+        || input.uncertainty_m.is_some()
+        || input.valid_fraction.is_some()
+        || input.coordinate_frame.is_some()
+        || input.calibration_ref.is_some()
+    {
+        return Err(StoreError::InvalidInput(
+            "relative depth/provenance is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_event(event: &ObservationEventInput) -> Result<()> {
+    if event.observation_id <= 0
+        || event.camera_id.is_empty()
+        || event.zone.is_empty()
+        || event.label.is_empty()
+        || event.source.is_empty()
+        || !["appeared", "disappeared", "observed"].contains(&event.event_type.as_str())
+        || event.occurred_at > event.noticed_at
+        || event.hits <= 0
+        || event.seen_for_s.is_some_and(|v| !v.is_finite() || v < 0.0)
+        || event.occurred_at.timestamp_nanos_opt().is_none()
+        || event.noticed_at.timestamp_nanos_opt().is_none()
+    {
+        return Err(StoreError::InvalidInput(
+            "event identity/timestamps/values are invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn upsert_bounded_geometry(
+    conn: &Connection,
+    observation_id: i64,
+    input: &GeometryInput,
+    preserve_late_last: bool,
+) -> Result<(i64, bool)> {
+    if input.sample_kind != "first" && input.sample_kind != "last" {
+        return Err(StoreError::InvalidInput(
+            "only first/last geometry can be recorded".into(),
+        ));
+    }
+    let existing: Option<(i64, String)> = conn.query_row(
+        "SELECT id,captured_at FROM observation_geometry WHERE observation_id=?1 AND sample_kind=?2",
+        params![observation_id, input.sample_kind],
+        |r| Ok((r.get(0)?,r.get(1)?)),
+    ).optional()?;
+    if let Some((id, timestamp)) = &existing {
+        let timestamp = parse_ts_value(timestamp.clone())?;
+        let changes_bound = if input.sample_kind == "first" {
+            input.captured_at < timestamp
+        } else {
+            input.captured_at > timestamp
+        };
+        if !changes_bound {
+            if preserve_late_last && input.sample_kind == "last" {
+                let late_kind = format!(
+                    "ingress_last_{}",
+                    input.captured_at.timestamp_nanos_opt().unwrap_or_default()
+                );
+                conn.execute(
+                    "INSERT OR IGNORE INTO observation_geometry
+                     (observation_id,sample_kind,captured_at,x0,y0,x1,y1,frame_width,frame_height,zone,source,confidence,snapshot_ref)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    params![observation_id, late_kind, input.captured_at.to_rfc3339(), input.bbox[0], input.bbox[1], input.bbox[2], input.bbox[3], input.frame_width, input.frame_height, input.zone, input.source, input.confidence, input.snapshot_ref],
+                )?;
+                let ingress_id: i64 = conn.query_row(
+                    "SELECT id FROM observation_geometry WHERE observation_id=?1 AND sample_kind=?2",
+                    params![observation_id, late_kind],
+                    |row| row.get(0),
+                )?;
+                return Ok((ingress_id, true));
+            }
+            return Ok((*id, false));
+        }
+    }
+    conn.execute(
+        "INSERT INTO observation_geometry
+         (observation_id,sample_kind,captured_at,x0,y0,x1,y1,frame_width,frame_height,zone,source,confidence,snapshot_ref)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+         ON CONFLICT(observation_id,sample_kind) DO UPDATE SET
+         captured_at=excluded.captured_at,x0=excluded.x0,y0=excluded.y0,x1=excluded.x1,y1=excluded.y1,
+         frame_width=excluded.frame_width,frame_height=excluded.frame_height,zone=excluded.zone,
+         source=excluded.source,confidence=excluded.confidence,snapshot_ref=excluded.snapshot_ref",
+        params![observation_id,input.sample_kind,input.captured_at.to_rfc3339(),
+            input.bbox[0],input.bbox[1],input.bbox[2],input.bbox[3],input.frame_width,input.frame_height,
+            input.zone,input.source,input.confidence,input.snapshot_ref],
+    )?;
+    let id = match existing {
+        Some((id, _)) => id,
+        None => conn.last_insert_rowid(),
+    };
+    conn.execute(
+        "DELETE FROM depth_evidence WHERE geometry_id=?1",
+        params![id],
+    )?;
+    Ok((id, true))
+}
+
+fn insert_depth(conn: &Connection, geometry_id: i64, input: &DepthInput) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO depth_evidence
+         (geometry_id,provider,frame_id,response_id,prompt_version,backend_version,mode,
+          relation_to_camera,relative_score,quality,model_ref,value_m,uncertainty_m,
+          valid_fraction,coordinate_frame,calibration_ref)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+        params![
+            geometry_id,
+            input.provider,
+            input.frame_id,
+            input.response_id,
+            input.prompt_version,
+            input.backend_version,
+            input.mode,
+            input.relation_to_camera,
+            input.relative_score,
+            input.quality,
+            input.model_ref,
+            input.value_m,
+            input.uncertainty_m,
+            input.valid_fraction,
+            input.coordinate_frame,
+            input.calibration_ref,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn copy_geometry_tx(conn: &Connection, source_id: i64, kind: &str) -> Result<i64> {
+    if kind == "first" || kind == "last" || kind.is_empty() {
+        return Err(StoreError::InvalidInput(
+            "event copy requires a non-moving sample kind".into(),
+        ));
+    }
+    let source_observation: i64 = conn.query_row(
+        "SELECT observation_id FROM observation_geometry WHERE id=?1",
+        params![source_id],
+        |r| r.get(0),
+    )?;
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM observation_geometry WHERE observation_id=?1 AND sample_kind=?2",
+            params![source_observation, kind],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT INTO observation_geometry
+         (observation_id,sample_kind,captured_at,x0,y0,x1,y1,frame_width,frame_height,zone,source,confidence,snapshot_ref)
+         SELECT observation_id,?2,captured_at,x0,y0,x1,y1,frame_width,frame_height,zone,source,confidence,snapshot_ref
+         FROM observation_geometry WHERE id=?1",params![source_id,kind],
+    )?;
+    let id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO depth_evidence
+         (geometry_id,provider,frame_id,response_id,prompt_version,backend_version,mode,
+          relation_to_camera,relative_score,quality,model_ref,value_m,uncertainty_m,
+          valid_fraction,coordinate_frame,calibration_ref)
+         SELECT ?2,provider,frame_id,response_id,prompt_version,backend_version,mode,
+          relation_to_camera,relative_score,quality,model_ref,value_m,uncertainty_m,
+          valid_fraction,coordinate_frame,calibration_ref
+         FROM depth_evidence WHERE geometry_id=?1",
+        params![source_id, id],
+    )?;
+    Ok(id)
+}
+
+fn insert_event(
+    conn: &Connection,
+    event: &ObservationEventInput,
+    geometry_id: Option<i64>,
+) -> Result<i64> {
+    let identity: (String, String, String) = conn.query_row(
+        "SELECT camera_id,zone,label FROM observations WHERE id=?1",
+        params![event.observation_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if identity
+        != (
+            event.camera_id.clone(),
+            event.zone.clone(),
+            event.label.clone(),
+        )
+    {
+        return Err(StoreError::InvalidInput(
+            "event identity does not match observation".into(),
+        ));
+    }
+    conn.execute(
+        "INSERT INTO observation_events
+         (observation_id,camera_id,zone,label,event_type,occurred_at,noticed_at,source,session_id,reason,hits,seen_for_s,geometry_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![event.observation_id,event.camera_id,event.zone,event.label,event.event_type,
+            event.occurred_at.to_rfc3339(),event.noticed_at.to_rfc3339(),event.source,event.session_id,
+            event.reason,event.hits,event.seen_for_s,geometry_id],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn parse_ts_value(s: String) -> rusqlite::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })
+}
+
+fn geometry_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ObservationGeometry> {
+    Ok(ObservationGeometry {
+        id: r.get(0)?,
+        observation_id: r.get(1)?,
+        sample_kind: r.get(2)?,
+        captured_at: parse_ts_value(r.get(3)?)?,
+        bbox: [r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?],
+        frame_width: r.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+        frame_height: r.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+        zone: r.get(10)?,
+        source: r.get(11)?,
+        confidence: r.get(12)?,
+        snapshot_ref: r.get(13)?,
+    })
+}
+
+fn event_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ObservationEvent> {
+    Ok(ObservationEvent {
+        id: r.get(0)?,
+        observation_id: r.get(1)?,
+        camera_id: r.get(2)?,
+        zone: r.get(3)?,
+        label: r.get(4)?,
+        event_type: r.get(5)?,
+        occurred_at: parse_ts_value(r.get(6)?)?,
+        noticed_at: parse_ts_value(r.get(7)?)?,
+        source: r.get(8)?,
+        session_id: r.get(9)?,
+        reason: r.get(10)?,
+        hits: r.get(11)?,
+        seen_for_s: r.get(12)?,
+        geometry_id: r.get(13)?,
+    })
+}
+
+fn depth_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DepthEvidence> {
+    Ok(DepthEvidence {
+        id: r.get(0)?,
+        geometry_id: r.get(1)?,
+        provider: r.get(2)?,
+        frame_id: r.get(3)?,
+        response_id: r.get(4)?,
+        prompt_version: r.get(5)?,
+        backend_version: r.get(6)?,
+        mode: r.get(7)?,
+        relation_to_camera: r.get(8)?,
+        relative_score: r.get(9)?,
+        quality: r.get(10)?,
+        model_ref: r.get(11)?,
+        value_m: r.get(12)?,
+        uncertainty_m: r.get(13)?,
+        valid_fraction: r.get(14)?,
+        coordinate_frame: r.get(15)?,
+        calibration_ref: r.get(16)?,
+    })
 }
 
 #[cfg(test)]
@@ -670,5 +1628,157 @@ mod tests {
         assert_eq!(s.count_observations().unwrap(), 1);
         assert_eq!(s.observation_ids().unwrap(), vec![fresh]);
         assert_eq!(s.recent(None, 10).unwrap()[0].label, "keys");
+    }
+
+    fn geometry(kind: &str, at: DateTime<Utc>) -> GeometryInput {
+        GeometryInput {
+            sample_kind: kind.into(),
+            captured_at: at,
+            bbox: [10.0, 20.0, 60.0, 80.0],
+            frame_width: Some(100),
+            frame_height: Some(100),
+            zone: "desk".into(),
+            source: "test".into(),
+            confidence: Some(0.9),
+            snapshot_ref: None,
+        }
+    }
+
+    fn depth() -> DepthInput {
+        DepthInput {
+            provider: "test-depth".into(),
+            frame_id: "frame-1".into(),
+            response_id: "response-1".into(),
+            prompt_version: "prompt-1".into(),
+            backend_version: "backend-1".into(),
+            mode: "relative".into(),
+            relation_to_camera: "nearer".into(),
+            relative_score: Some(0.8),
+            quality: "good".into(),
+            model_ref: Some("model".into()),
+            value_m: None,
+            uncertainty_m: None,
+            valid_fraction: None,
+            coordinate_frame: None,
+            calibration_ref: None,
+        }
+    }
+
+    fn event_for(obs: i64, geometry_id: Option<i64>) -> ObservationEventInput {
+        ObservationEventInput {
+            observation_id: obs,
+            camera_id: "cam1".into(),
+            zone: "desk".into(),
+            label: "keys".into(),
+            event_type: "observed".into(),
+            occurred_at: ts(1),
+            noticed_at: ts(2),
+            source: "test".into(),
+            session_id: Some("session".into()),
+            reason: "test".into(),
+            hits: 1,
+            seen_for_s: None,
+            geometry_id,
+        }
+    }
+
+    #[test]
+    fn typed_sighting_persists_first_last_and_depth_atomically() {
+        let s = Store::in_memory().unwrap();
+        let input = SightingInput {
+            camera_id: "cam1".into(),
+            zone: "desk".into(),
+            label: "keys".into(),
+            seen_at: ts(1),
+            snapshot: None,
+            window_seconds: 300,
+            geometry: Some(geometry("last", ts(1))),
+            depth: Some(depth()),
+        };
+        let (obs, is_new, hits, last) = s.record_sighting_with_geometry(&input).unwrap();
+        assert!(is_new);
+        assert_eq!(hits, 1);
+        let last = last.unwrap();
+        let geometries = s.geometry_for_observation(obs).unwrap();
+        assert_eq!(
+            geometries
+                .iter()
+                .map(|g| g.sample_kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "last"]
+        );
+        assert_eq!(s.depth_for_geometry(last).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn invalid_depth_rolls_back_observation_and_geometry() {
+        let s = Store::in_memory().unwrap();
+        let mut bad = depth();
+        bad.relation_to_camera = "near".into();
+        let input = SightingInput {
+            camera_id: "cam1".into(),
+            zone: "desk".into(),
+            label: "keys".into(),
+            seen_at: ts(1),
+            snapshot: None,
+            window_seconds: 300,
+            geometry: Some(geometry("last", ts(1))),
+            depth: Some(bad),
+        };
+        assert!(s.record_sighting_with_geometry(&input).is_err());
+        assert_eq!(s.count_observations().unwrap(), 0);
+    }
+
+    #[test]
+    fn observed_event_checks_identity_and_geometry_owner() {
+        let s = Store::in_memory().unwrap();
+        let (obs, _, _) = s
+            .record_sighting("cam1", "desk", "keys", ts(1), None, DEFAULT_DEDUP_WINDOW)
+            .unwrap();
+        let geometry_id = s
+            .record_geometry(
+                obs,
+                "last",
+                ts(1),
+                [1.0, 1.0, 2.0, 2.0],
+                None,
+                None,
+                "desk",
+                "test",
+                None,
+                None,
+            )
+            .unwrap();
+        let id = s
+            .append_observation_event(&event_for(obs, Some(geometry_id)))
+            .unwrap();
+        assert!(id > 0);
+        let mut mismatch = event_for(obs, Some(geometry_id));
+        mismatch.label = "wallet".into();
+        assert!(s.append_observation_event(&mismatch).is_err());
+        let (other, _, _) = s
+            .record_sighting("cam1", "desk", "wallet", ts(1), None, DEFAULT_DEDUP_WINDOW)
+            .unwrap();
+        let mut foreign = event_for(other, Some(geometry_id));
+        foreign.label = "wallet".into();
+        assert!(s.append_observation_event(&foreign).is_err());
+    }
+
+    #[test]
+    fn copied_geometry_keeps_depth_evidence() {
+        let s = Store::in_memory().unwrap();
+        let input = SightingInput {
+            camera_id: "cam1".into(),
+            zone: "desk".into(),
+            label: "keys".into(),
+            seen_at: ts(1),
+            snapshot: None,
+            window_seconds: 300,
+            geometry: Some(geometry("last", ts(1))),
+            depth: Some(depth()),
+        };
+        let (_, _, _, last) = s.record_sighting_with_geometry(&input).unwrap();
+        let copied = s.copy_geometry(last.unwrap(), "event_observed_1").unwrap();
+        assert_eq!(s.depth_for_geometry(copied).unwrap().len(), 1);
     }
 }
