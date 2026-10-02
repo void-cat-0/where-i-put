@@ -33,6 +33,16 @@ fn main() {
             .collect(),
         Err(e) => {
             println!("cargo:warning=reading {}: {e}", bin.display());
+            // On Linux, source builds put .so files in lib/, not bin/.
+            // Emit rpath so the binary finds them at runtime.
+            #[cfg(target_family = "unix")]
+            {
+                let lib = Path::new(&ffmpeg_dir).join("lib");
+                if lib.is_dir() {
+                    println!("cargo:rustc-link-search=native={}", lib.display());
+                    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+                }
+            }
             return;
         }
     };
