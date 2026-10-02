@@ -14,3 +14,9 @@ clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tower = { version = "0.5", features = ["util"] }
+image.workspace = true

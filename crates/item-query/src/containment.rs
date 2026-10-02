@@ -33,6 +33,12 @@ pub struct Candidate {
     pub cover_geometry_id: Option<i64>,
     pub target_label: String,
     pub cover_label: String,
+    /// When the target was last directly seen (its last hit) and when the
+    /// cover appeared; the card's timeline is built from these two facts.
+    pub target_last_hit: DateTime<Utc>,
+    pub cover_appeared_at: DateTime<Utc>,
+    pub camera_id: String,
+    pub zone: String,
     pub relation: &'static str,
     /// Deterministic heuristic score. It is not a probability or calibrated
     /// confidence and should only be used to order candidates.
@@ -76,7 +82,9 @@ pub fn find_candidates(
             is_cover_appearance(event, target, session_id)
                 && within_last_hit_window(event.event.occurred_at, target.event.occurred_at, window)
         }) {
-            let Some(cover) = cover_lifecycle(events, cover_appearance, target, window) else {
+            let Some((cover, persistence)) =
+                cover_lifecycle(events, cover_appearance, target, window)
+            else {
                 continue;
             };
             let Some(cover_geo) = valid_geometry(cover.geometry.as_ref()) else {
@@ -126,7 +134,6 @@ pub fn find_candidates(
             } else {
                 "possibly_occluded_by"
             };
-            let persistence = persistence_evidence(cover_appearance, cover);
             let temporal_distance = target
                 .event
                 .occurred_at
@@ -148,15 +155,23 @@ pub fn find_candidates(
                 EvidenceContribution {
                     kind: "temporal_proximity",
                     state: "supporting",
-                    detail: format!(
-                        "cover lifecycle is {} from the target's last hit",
-                        format_delta(
-                            cover_appearance
-                                .event
-                                .occurred_at
-                                .signed_duration_since(target.event.occurred_at)
-                        )
-                    ),
+                    detail: {
+                        let offset = cover_appearance
+                            .event
+                            .occurred_at
+                            .signed_duration_since(target.event.occurred_at);
+                        if offset < Duration::zero() {
+                            format!(
+                                "cover appeared {} before the target's last hit",
+                                format_delta(-offset)
+                            )
+                        } else {
+                            format!(
+                                "cover appeared {} after the target's last hit",
+                                format_delta(offset)
+                            )
+                        }
+                    },
                 },
                 EvidenceContribution {
                     kind: "projected_overlap",
@@ -261,6 +276,10 @@ pub fn find_candidates(
                 cover_geometry_id: cover.geometry.as_ref().map(|geometry| geometry.id),
                 target_label: target.event.label.clone(),
                 cover_label: cover.event.label.clone(),
+                target_last_hit: target.event.occurred_at,
+                cover_appeared_at: cover_appearance.event.occurred_at,
+                camera_id: target.event.camera_id.clone(),
+                zone: target_geo.zone.clone(),
                 relation,
                 score,
                 same_label_ambiguous,
@@ -324,14 +343,16 @@ fn target_reappeared(events: &[SceneEvent], target: &SceneEvent, session_id: &st
 }
 
 /// Select the lifecycle record that proves a cover persisted and the geometry
-/// nearest the target's last hit. A later `disappeared` record is useful: it is
-/// the immutable last/closed geometry for a pre-existing cover.
+/// nearest the target's last hit, together with the persistence the whole
+/// lifecycle shows. A later `disappeared` record is useful: it is the
+/// immutable last/closed geometry for a pre-existing cover, and it carries the
+/// cover's final hit count and residence time.
 fn cover_lifecycle<'a>(
     events: &'a [SceneEvent],
     appearance: &'a SceneEvent,
     target: &SceneEvent,
     window: Duration,
-) -> Option<&'a SceneEvent> {
+) -> Option<(&'a SceneEvent, Persistence)> {
     let mut related: Vec<&SceneEvent> = events
         .iter()
         .filter(|event| {
@@ -377,6 +398,19 @@ fn cover_lifecycle<'a>(
         return None;
     }
 
+    let persistence = Persistence {
+        seconds: related
+            .iter()
+            .filter_map(|event| event.event.seen_for_s)
+            .map(|seconds| seconds as f32)
+            .fold(duration.num_milliseconds().max(0) as f32 / 1000.0, f32::max),
+        hits: related
+            .iter()
+            .map(|event| event.event.hits)
+            .max()
+            .unwrap_or(0),
+    };
+
     // Prefer geometry at or just before the target, otherwise the appearance
     // geometry. This permits a closed/last sample without comparing frames.
     related
@@ -388,32 +422,13 @@ fn cover_lifecycle<'a>(
                 .iter()
                 .find(|event| event.event.id == appearance.event.id)
         })
+        .map(|geometry| (geometry, persistence))
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Persistence {
     seconds: f32,
     hits: i64,
-}
-
-fn persistence_evidence(appearance: &SceneEvent, cover: &SceneEvent) -> Persistence {
-    let seconds = cover
-        .event
-        .occurred_at
-        .signed_duration_since(appearance.event.occurred_at)
-        .num_milliseconds()
-        .max(0) as f32
-        / 1000.0;
-    let declared = cover
-        .event
-        .seen_for_s
-        .map(|seconds| seconds as f32)
-        .unwrap_or(seconds)
-        .max(seconds);
-    Persistence {
-        seconds: declared,
-        hits: cover.event.hits.max(appearance.event.hits),
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -799,6 +814,16 @@ mod tests {
                 .detail
                 .contains("ambiguous")
         );
+    }
+
+    #[test]
+    fn persistence_is_reported_from_the_whole_cover_lifecycle() {
+        // The appearance row (hits 1, no dwell) supplies the geometry; the
+        // later close row carries what the cover actually showed.
+        let candidates = find(&keys_then("box", [5.0, 5.0, 50.0, 50.0]));
+        let detail = &evidence(&candidates[0], "persistence").unwrap().detail;
+        assert!(detail.contains("4.0s"), "{detail}");
+        assert!(detail.contains("at least 3 hits"), "{detail}");
     }
 
     #[test]

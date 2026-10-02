@@ -47,6 +47,31 @@
   dialog img{display:block;max-width:100%}
   dialog .cap{padding:10px 16px;display:flex;justify-content:space-between;align-items:center}
   footer{color:var(--dim);font-size:12px;text-align:center;padding:8px 20px 18px}
+  /* G5 evidence cards: the direct sighting is the answer; a hypothesis is
+     visibly a different, dashed thing underneath it. */
+  #answer .direct{font-size:16px}
+  #answer .note{color:var(--dim);font-size:13px;margin-top:6px}
+  #cards{display:flex;flex-direction:column;gap:12px;margin-top:12px}
+  .ev{border:1px dashed #6b7488;border-radius:10px;padding:12px 14px;background:var(--card2)}
+  .ev .tag{display:inline-block;font-size:11px;letter-spacing:.6px;text-transform:uppercase;
+    color:#fbbf24;border:1px solid #fbbf2466;border-radius:4px;padding:0 6px;margin-right:8px}
+  .ev h3{margin:0 0 6px;font-size:15px;font-weight:600;display:flex;align-items:center;flex-wrap:wrap;gap:4px}
+  .ev .score{margin-left:auto;color:var(--dim);font-size:12px;font-weight:400}
+  .ev .expl{color:var(--dim);font-size:13px;margin:0 0 8px}
+  .ev .tl{display:flex;gap:6px;flex-wrap:wrap;font-size:12.5px;margin-bottom:8px}
+  .ev .tl span{background:var(--chip);border-radius:6px;padding:2px 8px}
+  .ev ul{list-style:none;margin:0 0 8px;padding:0;display:flex;flex-direction:column;gap:3px;font-size:13px}
+  .ev li .st{display:inline-block;min-width:84px;font-size:11.5px;font-weight:600}
+  .st-supporting{color:#4ade80} .st-conflicting{color:#f87171} .st-unknown{color:#9aa3b5}
+  .ev .shots{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+  .ev figure{margin:0;position:relative;width:min(320px,100%)}
+  .ev figure img,.ev figure .blank{width:100%;aspect-ratio:16/9;object-fit:contain;background:#0c0e13;display:block;border-radius:6px}
+  .ev figure .blank{display:flex;align-items:center;justify-content:center;color:var(--dim);font-size:12px}
+  .ev figure svg{position:absolute;inset:0;width:100%;aspect-ratio:16/9;pointer-events:none}
+  .ev figcaption{font-size:11.5px;color:var(--dim);margin-top:3px}
+  .ev details{font-size:12px;color:var(--dim)}
+  .ev details code{word-break:break-all}
+  .ev .caveat{font-size:12px;color:#fbbf24cc;margin-top:6px}
 </style>
 </head>
 <body>
@@ -141,13 +166,77 @@ async function ask(){
   answer.style.display='block';
   answer.textContent='thinking…';
   const r=await fetch('/api/ask?q='+encodeURIComponent(t));
+  if(!r.ok){answer.textContent='ask failed ('+r.status+')';return}
   const d=await r.json();
-  if(d.mode==='vlm'){answer.textContent=d.answer;return}
-  if(d.error){answer.textContent='(VLM failed: '+d.error+') '}
   const m=d.matched||[];
-  answer.textContent=m.length
-    ? 'log match for “'+t+'”: '+m.map(o=>o.label+' @ '+o.zone+' ('+relTime(o.last_seen)+')').join('; ')
-    : 'nothing recorded that matches “'+t+'” yet.';
+  // The direct last sighting always leads; a VLM sentence or a hypothesis
+  // never replaces it.
+  let html='';
+  if(d.mode==='vlm')html+='<div class="direct">'+esc(d.answer)+'</div>';
+  else if(m.length){
+    const o=m[0];
+    html+='<div class="direct"><b>'+esc(o.label)+'</b> was last directly seen at <b>'+
+      esc(o.camera)+' / '+esc(o.zone)+'</b>, '+esc(relTime(o.last_seen))+'.</div>';
+    if(m.length>1)html+='<div class="note">earlier: '+m.slice(1,6).map(o=>
+      esc(o.label)+' @ '+esc(o.zone)+' ('+esc(relTime(o.last_seen))+')').join('; ')+'</div>';
+  }else html+='<div class="direct">Nothing recorded that matches “'+esc(t)+'” yet.</div>';
+  if(d.error)html+='<div class="note">VLM unavailable ('+esc(d.error)+'); showing the log.</div>';
+  if(d.note)html+='<div class="note">'+esc(d.note)+'</div>';
+  const cards=d.cards||[];
+  if(cards.length)html+='<div id="cards">'+cards.map(evidenceCard).join('')+'</div>';
+  else if(m.length&&!d.note)html+='<div class="note">No supported covering/container hypothesis was found.</div>';
+  answer.innerHTML=html;
+}
+
+const fmtTime=iso=>new Date(iso).toLocaleTimeString();
+const signed=s=>(s>=0?'+':'−')+Math.abs(s).toFixed(1)+' s';
+
+function evidenceCard(c){
+  const d=c.direct, h=c.hypothesis, p=c.provenance;
+  const ev=h.evidence.map(e=>'<li><span class="st st-'+esc(e.state)+'">'+esc(e.state)+'</span> '+
+    '<b>'+esc(e.kind.replace(/_/g,' '))+'</b> — '+esc(e.detail)+'</li>').join('');
+  const depth=c.depth.length
+    ? '<p>depth: '+c.depth.map(x=>esc(x.role)+' '+esc(x.relation_to_camera)+' ('+esc(x.provider)+
+        (x.model_ref?' / '+esc(x.model_ref):'')+', '+esc(x.mode)+', quality '+esc(x.quality)+')').join('; ')+'</p>'
+    : '<p>depth: none recorded</p>';
+  return '<section class="ev">'+
+    '<h3><span class="tag">hypothesis</span>'+esc(d.label)+' may be '+esc(h.phrase)+' the '+
+      esc(h.cover_label)+'<span class="score" title="ranks hypotheses; not a probability">score '+
+      Number(h.score).toFixed(2)+' · '+esc(h.relation)+'</span></h3>'+
+    '<p class="expl">'+esc(h.explanation)+'</p>'+
+    '<div class="tl"><span>'+esc(d.label)+' last seen '+esc(fmtTime(h.target_last_hit))+'</span>'+
+      '<span>'+esc(h.cover_label)+' appeared '+esc(signed(h.cover_offset_s))+'</span>'+
+      '<span>'+esc(d.camera)+' / '+esc(d.zone)+'</span></div>'+
+    '<ul>'+ev+'</ul>'+
+    '<div class="shots">'+shot(c.geometry.target,c.geometry.cover,d.label+' (last seen)')+
+      shot(c.geometry.cover,c.geometry.target,h.cover_label)+'</div>'+
+    '<details><summary>provenance</summary>'+depth+
+      '<p>rule <code>'+esc(p.rule_version)+'</code> · priors <code>'+esc(p.priors_ref)+'</code> · events #'+
+      Number(p.target_event_id)+' / #'+Number(p.cover_event_id)+'</p></details>'+
+    '<div class="caveat">'+esc(c.caveat)+'</div>'+
+  '</section>';
+}
+
+// One evidence sample: its own snapshot (if any) with both boxes drawn on
+// top, so the overlap the rule measured is visible. The sample's box is solid,
+// the other side's is dashed.
+function shot(own,other,caption){
+  if(!own)return '';
+  const w=Number(own.frame_width)||0, hgt=Number(own.frame_height)||0;
+  const rect=(g,cls)=>{
+    if(!g||!w||!hgt||g.frame_width!==own.frame_width||g.frame_height!==own.frame_height)return '';
+    const [x0,y0,x1,y1]=g.bbox.map(Number);
+    return '<rect class="'+cls+'" x="'+x0+'" y="'+y0+'" width="'+(x1-x0)+'" height="'+(y1-y0)+'" fill="none" '+
+      (cls==='own'?'stroke="#7dd3fc" stroke-width="'+Math.max(2,w/320)+'"'
+                  :'stroke="#fbbf24" stroke-dasharray="'+(w/80)+'" stroke-width="'+Math.max(2,w/400)+'"')+'/>';
+  };
+  const svg=w&&hgt?'<svg viewBox="0 0 '+w+' '+hgt+'" preserveAspectRatio="xMidYMid meet">'+
+    rect(other,'other')+rect(own,'own')+'</svg>':'';
+  const img=own.has_snapshot
+    ? '<img loading="lazy" src="/api/geometry/'+Number(own.geometry_id)+'/snapshot" alt="'+esc(caption)+'">'
+    : '<div class="blank">no snapshot for this sample</div>';
+  return '<figure>'+img+svg+'<figcaption>'+esc(caption)+' · '+esc(own.source)+' · '+
+    esc(fmtTime(own.captured_at))+'</figcaption></figure>';
 }
 $('#askbtn').onclick=ask;
 askq.addEventListener('keydown',e=>{if(e.key==='Enter')ask()});

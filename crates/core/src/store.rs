@@ -94,6 +94,15 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// `PRAGMA user_version`: 2 once lifecycle/geometry evidence exists. A
+    /// read-only opener never migrates, so a reader uses this to tell an older
+    /// database (no evidence tables yet) apart from a real read failure.
+    pub fn schema_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?)
+    }
+
     /// Fold the WAL back into the main database file. Called on daemon
     /// shutdown so a stopped process leaves one compact file
     /// (docs/resident-ingest.md §3/§7). `wal_checkpoint` returns a row, so

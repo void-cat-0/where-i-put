@@ -1,7 +1,8 @@
 # Geometry and containment evidence model
 
-> Status: G1–G4 are implemented (G4 on the read side, from a priors file); G5
-> (query/UI evidence cards) remains future work.
+> Status: G1–G5 are implemented (G4 on the read side, from a priors file; G5
+> as item-web evidence cards). Persisted inferences (§6.2) and the §10
+> acceptance set on real footage remain open.
 >
 > This document is both the design contract and the implementation boundary for
 > the inference layer: using image geometry, relative depth, object size, time,
@@ -526,12 +527,26 @@ and that no supported covering/container relation was found.
   of opening state or interior, metric size from calibrated depth, and
   persisting accepted inferences (§6.2).
 
-### Phase G5: query and UI evidence cards — future
+### Phase G5: query and UI evidence cards — implemented
 
-- Display the last direct sighting, cover evidence, timestamps, relation,
-  heuristic score, explanation, snapshots, and measurement provenance.
-- Never display a probabilistic inference as a direct observation or claim that
-  a VLM has validated containment.
+- `item-web` (`--priors` as in `item-query`) answers `/api/ask` with the
+  direct sightings first and up to five evidence cards. A card carries the
+  direct last sighting, relation and plain-words phrase, heuristic score,
+  explanation, timeline (target last hit, cover appearance offset), every
+  evidence contribution with its supporting/conflicting/unknown state, both
+  geometry samples with their own snapshots (`/api/geometry/{id}/snapshot`),
+  relative-depth provenance, rule version, priors reference, event ids, and a
+  fixed caveat.
+- The page renders the direct sighting as the answer and each card as a
+  visibly separate, dashed "hypothesis" block, with both boxes drawn over each
+  sample's snapshot. A VLM sentence, when configured, replaces only the wording
+  of the answer line; the cards are always shown from the deterministic rules.
+- Readers report a database older than schema v2 as "only direct sightings
+  are available" instead of failing (they open read-only and never migrate).
+- `cargo run -p item-web --example evidence_demo` writes a synthetic
+  keys-and-shoebox scene for inspecting the cards without a camera.
+- Not implemented: persisting accepted inferences and their evidence links
+  (§6.2), inference expiry, and the §10 acceptance set on real footage.
 
 ## 10. Verification scenarios
 

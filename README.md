@@ -41,9 +41,10 @@ Crates, one-way dependencies (`item-ingest`/`item-query`/`item-web` -> `item-cor
 - **crates/item-web** — the display side. Read-only web UI (binds 127.0.0.1:8478
   by default): one binary serving a zero-build vanilla-JS card grid (snapshot,
   zone/camera chips, hit count, relative time; live-search filter; ask bar that
-  answers from the log or via the VLM sidecar when configured; click-to-zoom
+  answers with the direct last sighting plus hypothesis evidence cards, worded
+  via the VLM sidecar when configured; click-to-zoom
   snapshot modal; 10 s auto-refresh) plus a small JSON API (`/api/observations`,
-  `/api/observation/{id}/snapshot`, `/api/ask`). Opens the same SQLite WAL file
+  `/api/observation/{id}/snapshot`, `/api/geometry/{id}/snapshot`, `/api/ask`). Opens the same SQLite WAL file
   the daemon writes, read-only — no write path, no contention, no shared process.
 
 ## Quick start
@@ -385,8 +386,16 @@ Building blocks, in order:
    interval logic, the cover reaches over most of the target's last box, and
    identity is unambiguous; built-in class priors alone never promote. It is
    still a qualified hypothesis, never an observed location.
-6. **G5 — future.** Query/WebUI evidence cards, visual opening-state and
-   interior estimation, and persisted inferences remain planned.
+6. **G5 — evidence cards: landed.** `item-web --priors <file>` answers the
+   ask bar with the direct last sighting first, then each hypothesis as a
+   separate card: relation, heuristic score, timeline, every evidence item
+   marked supporting / conflicting / unknown, both boxes drawn over their own
+   snapshots, depth provenance, and rule/priors versions. Try it without a
+   camera: `cargo run -p item-web --example evidence_demo`, then
+   `cargo run -p item-web -- --db target/evidence-demo/items.db --priors crates/item-query/priors.example.toml`.
+7. **Still open.** Persisted inferences with evidence links, inference expiry,
+   visual opening-state/interior estimation, and the design's acceptance
+   scenarios on real footage.
    Any future moved-with/container tracking or open-lid VLM checks must remain
    qualified hypotheses with auditable evidence, never an automatic transfer
    of an item's observed position to a container.

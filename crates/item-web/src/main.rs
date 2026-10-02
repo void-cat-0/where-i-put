@@ -4,6 +4,11 @@
 //! JSON API. Opens the same SQLite file the ingest daemon writes, read-only
 //! (WAL allows concurrent readers), so web and daemon never contend. VLM
 //! answering is reused from item-query when ITEM_VLM_BASE_URL/MODEL are set.
+//!
+//! The ask answer always leads with the direct last sighting; cover
+//! hypotheses follow as evidence cards (G5) and are never merged into it.
+
+mod evidence;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -13,12 +18,20 @@ use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
+use chrono::Duration;
 use clap::Parser;
 
 use item_core::Observation;
 use item_core::store::Store;
+use item_query::affordance::Priors;
+use item_query::{CandidateLookup, candidates_for};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
+
+/// The window `item-query ask` uses; both frontends answer the same way.
+const ASK_WINDOW_SECS: i64 = 10;
+/// Cards shown per question: the best-ranked first.
+const MAX_CARDS: usize = 5;
 
 #[derive(Parser)]
 #[command(name = "item-web")]
@@ -30,6 +43,11 @@ struct Args {
     /// Address to bind.
     #[arg(long, default_value = "127.0.0.1:8478")]
     listen: String,
+
+    /// TOML file of measured containers and object sizes, as for
+    /// `item-query --priors` (crates/item-query/priors.example.toml).
+    #[arg(long)]
+    priors: Option<PathBuf>,
 }
 
 type State_ = Arc<App>;
@@ -39,6 +57,7 @@ struct App {
     /// Base directory the daemon wrote snapshots relative to (paths in the
     /// db may be relative); usually the ingest process's cwd == our cwd.
     root: PathBuf,
+    priors: Priors,
     /// The sidecar client, built once from the environment (`None` when
     /// ITEM_VLM_BASE_URL/MODEL are unset). Held rather than rebuilt per
     /// request, so every ask reuses one connection pool.
@@ -74,6 +93,10 @@ impl App {
         } else {
             self.root.join(p)
         })
+    }
+
+    fn snapshot_exists(&self, stored: &str) -> bool {
+        self.resolve_snapshot(stored).is_some_and(|p| p.is_file())
     }
 }
 
@@ -134,22 +157,29 @@ async fn list(
     drop(store);
     Ok(axum::Json(
         obs.iter()
-            .map(|o| ObsJson::new(o, |s| app.resolve_snapshot(s).is_some_and(|p| p.is_file())))
+            .map(|o| ObsJson::new(o, |s| app.snapshot_exists(s)))
             .collect(),
     ))
 }
 
 async fn snapshot(State(app): State<State_>, AxPath(id): AxPath<i64>) -> Response {
-    let stored = {
-        let store = app.store();
-        match store.snapshot_path(id) {
-            Ok(Some(s)) => s,
-            _ => return (StatusCode::NOT_FOUND, "no snapshot").into_response(),
-        }
+    let stored = app.store().snapshot_path(id);
+    serve_snapshot(&app, stored.ok().flatten()).await
+}
+
+/// The image an evidence sample's box was drawn on. Geometry rows keep their
+/// own snapshot ref, which may differ from the observation's representative one.
+async fn geometry_snapshot(State(app): State<State_>, AxPath(id): AxPath<i64>) -> Response {
+    let stored = app.store().geometry_by_id(id);
+    serve_snapshot(&app, stored.ok().flatten().and_then(|g| g.snapshot_ref)).await
+}
+
+async fn serve_snapshot(app: &App, stored: Option<String>) -> Response {
+    let Some(stored) = stored else {
+        return (StatusCode::NOT_FOUND, "no snapshot").into_response();
     };
-    let path = match app.resolve_snapshot(&stored) {
-        Some(p) => p,
-        None => return (StatusCode::NOT_FOUND, "ref, not file").into_response(),
+    let Some(path) = app.resolve_snapshot(&stored) else {
+        return (StatusCode::NOT_FOUND, "ref, not file").into_response();
     };
     match tokio::fs::read(&path).await {
         Ok(bytes) => (
@@ -169,45 +199,101 @@ struct AskParams {
     q: String,
 }
 
-/// NL answering: same path as item-query's CLI (substring keyword -> log ->
-/// optional VLM formatting). Returns {answer} or {fallback log} shapes.
+/// Direct sightings plus evidence cards for one keyword. Cards are best-effort:
+/// a failed evidence read is reported next to the sightings, never instead of them.
+struct Answer {
+    obs: Vec<Observation>,
+    cards: Vec<evidence::Card>,
+    candidates: Vec<item_query::containment::Candidate>,
+    note: Option<String>,
+}
+
+fn answer_for(app: &App, word: &str) -> item_core::store::Result<Answer> {
+    let store = app.store();
+    let obs = store.recent(Some(word), 20)?;
+    let (candidates, note) = match candidates_for(
+        &store,
+        &obs,
+        None,
+        Duration::seconds(ASK_WINDOW_SECS),
+        200,
+        &app.priors,
+    ) {
+        Ok(lookup @ CandidateLookup::PreEvidenceSchema(_)) => (Vec::new(), lookup.note()),
+        Ok(CandidateLookup::Found(candidates)) => (candidates, None),
+        Err(e) => {
+            tracing::warn!(error = %e, "ask: reading cover evidence failed");
+            (Vec::new(), Some(format!("cover evidence unavailable: {e}")))
+        }
+    };
+    let mut cards = Vec::new();
+    for candidate in candidates.iter().take(MAX_CARDS) {
+        let Some(direct) = obs.iter().find(|o| o.id == candidate.target_observation_id) else {
+            continue;
+        };
+        match evidence::card(&store, direct, candidate, |s| app.snapshot_exists(s)) {
+            Ok(card) => cards.push(card),
+            Err(e) => tracing::warn!(error = %e, "ask: building an evidence card failed"),
+        }
+    }
+    Ok(Answer {
+        obs,
+        cards,
+        candidates,
+        note,
+    })
+}
+
+/// NL answering: same path as item-query's CLI (keyword -> log + cover
+/// evidence -> optional VLM wording). The response always carries the direct
+/// sightings and the evidence cards, whichever mode produced the sentence.
 async fn ask(State(app): State<State_>, Query(p): Query<AskParams>) -> Response {
     // The same keyword rule the CLI uses, so both answer from the same rows.
     let word = item_query::keyword_of(&p.q);
-    let obs = {
-        let store = app.store();
-        match store.recent(Some(&word), 20) {
-            Ok(obs) => obs,
-            // A failed read is not "nothing matched": say so, like `list`.
-            Err(e) => {
-                tracing::warn!(error = %e, "ask: reading observations failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+    let answer = match answer_for(&app, &word) {
+        Ok(answer) => answer,
+        // A failed read is not "nothing matched": say so, like `list`.
+        Err(e) => {
+            tracing::warn!(error = %e, "ask: reading observations failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let json_obs: Vec<ObsJson> = obs
+    let matched: Vec<ObsJson> = answer
+        .obs
         .iter()
-        .map(|o| ObsJson::new(o, |s| app.resolve_snapshot(s).is_some_and(|p| p.is_file())))
+        .map(|o| ObsJson::new(o, |s| app.snapshot_exists(s)))
         .collect();
+    let mut body = serde_json::json!({
+        "mode": "log",
+        "keyword": word,
+        "matched": matched,
+        "cards": answer.cards,
+        "note": answer.note,
+    });
     // One client (and one connection pool) for the process, built on first
     // ask; `None` means the env vars describing the sidecar are not set.
-    let client = app.vlm();
-    match client {
-        Some(client) => {
-            let prompt = item_query::build_prompt(&p.q, &obs);
-            match client.ask(&prompt).await {
-                Ok(answer) => axum::Json(serde_json::json!({ "mode": "vlm", "answer": answer }))
-                    .into_response(),
-                Err(e) => axum::Json(serde_json::json!({
-                    "mode": "log", "error": e.to_string(), "matched": json_obs,
-                }))
-                .into_response(),
+    if let Some(client) = app.vlm() {
+        let prompt =
+            item_query::build_prompt_with_candidates(&p.q, &answer.obs, &answer.candidates);
+        match client.ask(&prompt).await {
+            Ok(text) => {
+                body["mode"] = "vlm".into();
+                body["answer"] = text.into();
             }
-        }
-        None => {
-            axum::Json(serde_json::json!({ "mode": "log", "matched": json_obs })).into_response()
+            Err(e) => body["error"] = e.to_string().into(),
         }
     }
+    axum::Json(body).into_response()
+}
+
+fn router(app: State_) -> axum::Router {
+    axum::Router::new()
+        .route("/", get(index))
+        .route("/api/observations", get(list))
+        .route("/api/observation/{id}/snapshot", get(snapshot))
+        .route("/api/geometry/{id}/snapshot", get(geometry_snapshot))
+        .route("/api/ask", get(ask))
+        .with_state(app)
 }
 
 #[tokio::main]
@@ -220,6 +306,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    let priors = match &args.priors {
+        Some(path) => Priors::load(path)?,
+        None => Priors::builtin().clone(),
+    };
     // Strictly read-only: the ingest daemon owns writes, and a fallback to a
     // read-write open would create + migrate a database, or take the write
     // lock, exactly when the daemon is busy with it. A database that is not
@@ -242,18 +332,15 @@ async fn main() -> anyhow::Result<()> {
     let app = Arc::new(App {
         store: Mutex::new(store),
         root: std::env::current_dir()?,
+        priors,
         vlm: std::sync::OnceLock::new(),
     });
-    let router = axum::Router::new()
-        .route("/", get(index))
-        .route("/api/observations", get(list))
-        .route("/api/observation/{id}/snapshot", get(snapshot))
-        .route("/api/ask", get(ask))
-        .with_state(app);
-
     let addr: std::net::SocketAddr = args.listen.parse().context("bad --listen")?;
-    tracing::info!(%addr, db = %args.db, "item-web listening");
+    tracing::info!(%addr, db = %args.db, priors = %app.priors.reference(), "item-web listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router(app)).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

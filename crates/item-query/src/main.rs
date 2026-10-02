@@ -15,7 +15,8 @@ use chrono::Duration;
 use item_core::store::Store;
 use item_query::affordance::Priors;
 use item_query::build_prompt_with_candidates;
-use item_query::containment::{Candidate, find_candidates};
+use item_query::candidates_for;
+use item_query::containment::Candidate;
 use item_query::vlm::VlmClient;
 
 #[derive(Parser)]
@@ -102,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
             json,
         } => {
             let observations = store.recent(Some(&label), limit)?;
-            let candidates = query_candidates(
+            let lookup = candidates_for(
                 &store,
                 &observations,
                 camera.as_deref(),
@@ -110,12 +111,16 @@ async fn main() -> anyhow::Result<()> {
                 limit,
                 priors,
             )?;
+            if let Some(note) = lookup.note() {
+                eprintln!("{note}");
+            }
+            let candidates = lookup.candidates();
             if json {
-                println!("{}", serde_json::to_string_pretty(&candidates)?);
+                println!("{}", serde_json::to_string_pretty(candidates)?);
             } else if candidates.is_empty() {
                 println!("no supported cover candidates for '{label}'");
             } else {
-                print_candidates(&candidates);
+                print_candidates(candidates);
             }
         }
         Cmd::Ask { question, label } => {
@@ -128,11 +133,18 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             let candidates =
-                query_candidates(&store, &obs, None, Duration::seconds(10), 200, priors)
-                    .unwrap_or_else(|error| {
+                match candidates_for(&store, &obs, None, Duration::seconds(10), 200, priors) {
+                    Ok(lookup) => {
+                        if let Some(note) = lookup.note() {
+                            eprintln!("{note}");
+                        }
+                        lookup.candidates().to_vec()
+                    }
+                    Err(error) => {
                         eprintln!("cover evidence unavailable: {error}");
                         Vec::new()
-                    });
+                    }
+                };
             let prompt = build_prompt_with_candidates(&question, &obs, &candidates);
             match (
                 std::env::var("ITEM_VLM_BASE_URL"),
@@ -157,41 +169,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn query_candidates(
-    store: &Store,
-    observations: &[item_core::Observation],
-    camera: Option<&str>,
-    window: Duration,
-    limit: i64,
-    priors: &Priors,
-) -> anyhow::Result<Vec<Candidate>> {
-    let mut candidates = Vec::new();
-    for observation in observations {
-        if camera.is_some_and(|camera| camera != observation.camera_id) {
-            continue;
-        }
-        // Anchor the event window to the recorded target last hit, not now.
-        // Include the later missed-gap sweep and closed cover geometry.
-        let since = observation.last_seen - window;
-        let until = observation.last_seen + window.max(Duration::seconds(31));
-        let events = store.scene_events_for_camera(&observation.camera_id, since, until, limit)?;
-        for candidate in find_candidates(&events, &observation.label, window, priors) {
-            if candidate.target_observation_id == observation.id {
-                candidates.push(candidate);
-            }
-        }
-    }
-    candidates.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
-            .then_with(|| left.target_event_id.cmp(&right.target_event_id))
-            .then_with(|| left.cover_event_id.cmp(&right.cover_event_id))
-    });
-    candidates.dedup_by_key(|candidate| (candidate.target_event_id, candidate.cover_event_id));
-    Ok(candidates)
 }
 
 fn print_direct_answer(obs: &[item_core::Observation]) {

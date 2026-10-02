@@ -7,8 +7,85 @@ pub mod affordance;
 pub mod containment;
 pub mod vlm;
 
-use crate::containment::Candidate;
+use crate::affordance::Priors;
+use crate::containment::{Candidate, find_candidates};
+use chrono::Duration;
 use item_core::Observation;
+use item_core::store::Store;
+
+/// The first schema with lifecycle events and geometry (G1).
+pub const EVIDENCE_SCHEMA_VERSION: i64 = 2;
+
+/// Cover hypotheses for these observations, or why there are none to look at.
+#[derive(Debug)]
+pub enum CandidateLookup {
+    Found(Vec<Candidate>),
+    /// The database predates lifecycle evidence. Readers open read-only and
+    /// never migrate, so this lasts until the ingest side opens it once.
+    PreEvidenceSchema(i64),
+}
+
+impl CandidateLookup {
+    pub fn candidates(&self) -> &[Candidate] {
+        match self {
+            Self::Found(candidates) => candidates,
+            Self::PreEvidenceSchema(_) => &[],
+        }
+    }
+
+    /// A one-line note for the user when evidence could not be consulted.
+    pub fn note(&self) -> Option<String> {
+        match self {
+            Self::Found(_) => None,
+            Self::PreEvidenceSchema(version) => Some(format!(
+                "this database is schema v{version}, older than the lifecycle evidence (v{EVIDENCE_SCHEMA_VERSION}); \
+                 only direct sightings are available until item-ingest opens it once"
+            )),
+        }
+    }
+}
+
+/// Cover hypotheses whose target is one of `observations`, best first.
+///
+/// The event window is anchored to each observation's recorded last hit, not
+/// to now, and extends far enough past it to include the later missed-gap
+/// sweep and a cover's closing geometry.
+pub fn candidates_for(
+    store: &Store,
+    observations: &[Observation],
+    camera: Option<&str>,
+    window: Duration,
+    limit: i64,
+    priors: &Priors,
+) -> item_core::store::Result<CandidateLookup> {
+    let version = store.schema_version()?;
+    if version < EVIDENCE_SCHEMA_VERSION {
+        return Ok(CandidateLookup::PreEvidenceSchema(version));
+    }
+    let mut candidates = Vec::new();
+    for observation in observations {
+        if camera.is_some_and(|camera| camera != observation.camera_id) {
+            continue;
+        }
+        let since = observation.last_seen - window;
+        let until = observation.last_seen + window.max(Duration::seconds(31));
+        let events = store.scene_events_for_camera(&observation.camera_id, since, until, limit)?;
+        candidates.extend(
+            find_candidates(&events, &observation.label, window, priors)
+                .into_iter()
+                .filter(|candidate| candidate.target_observation_id == observation.id),
+        );
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.target_event_id.cmp(&right.target_event_id))
+            .then_with(|| left.cover_event_id.cmp(&right.cover_event_id))
+    });
+    candidates.dedup_by_key(|candidate| (candidate.target_event_id, candidate.cover_event_id));
+    Ok(CandidateLookup::Found(candidates))
+}
 
 /// The one content word a plain-language question is about
 /// (`"where are my keys?"` -> `"keys"`).
