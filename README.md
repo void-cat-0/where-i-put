@@ -33,7 +33,8 @@ Crates, one-way dependencies (`item-ingest`/`item-query`/`item-web` -> `item-cor
   camera at once, publishes a health snapshot, and keeps its own database and
   snapshot directory bounded.
 - **crates/item-query** — the read side. CLI (`log`, `ask`, `candidates`) over
-  observations and conservative 2-D cover hypotheses,
+  observations, conservative 2-D cover hypotheses, and size/container
+  evidence from an optional priors file,
   with an OpenAI-compatible VLM client (llama.cpp/Ollama/cloud sidecar) used
   only when `ITEM_VLM_BASE_URL`/`ITEM_VLM_MODEL` are set. The Rust core never
   embeds a VLM.
@@ -376,14 +377,23 @@ Building blocks, in order:
    comparable same-frame/provider-response ordering can support or conflict
    with a cover candidate. Missing or incomparable evidence stays `unknown`.
    This is not metric depth or validated containment accuracy.
-5. **G4/G5 — future.** Size intervals, usable-interior/affordance reasoning,
-   containment hypotheses, and query/WebUI evidence cards remain planned.
+5. **G4 — size and container affordance: landed (read side).**
+   `item-query --priors <file>` adds object size intervals and measured,
+   per-camera/zone container records ([example](crates/item-query/priors.example.toml)).
+   A cover candidate becomes `possibly_contained_in` only when the priors file
+   records that container as open with a usable interior the target fits by
+   interval logic, the cover reaches over most of the target's last box, and
+   identity is unambiguous; built-in class priors alone never promote. It is
+   still a qualified hypothesis, never an observed location.
+6. **G5 — future.** Query/WebUI evidence cards, visual opening-state and
+   interior estimation, and persisted inferences remain planned.
    Any future moved-with/container tracking or open-lid VLM checks must remain
    qualified hypotheses with auditable evidence, never an automatic transfer
    of an item's observed position to a container.
 
 ```sh
 cargo run -p item-query -- --db data/items.db candidates keys --camera desk --window-secs 120 --json
+cargo run -p item-query -- --db data/items.db --priors priors.toml ask "where are my keys?"
 ```
 
 The command reads lifecycle evidence already written by ingest; it does not

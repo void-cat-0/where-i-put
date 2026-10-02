@@ -1,7 +1,7 @@
 # Geometry and containment evidence model
 
-> Status: G1–G3 are implemented; G4 (size/affordance) and G5 (query/UI
-> evidence cards) remain future work.
+> Status: G1–G4 are implemented (G4 on the read side, from a priors file); G5
+> (query/UI evidence cards) remains future work.
 >
 > This document is both the design contract and the implementation boundary for
 > the inference layer: using image geometry, relative depth, object size, time,
@@ -503,13 +503,28 @@ and that no supported covering/container relation was found.
 - The current provider never emits metric distance, calibration, or a physical
   containment decision. Missing or incomparable output remains `unknown`.
 
-### Phase G4: add size and affordance reasoning — future
+### Phase G4: add size and affordance reasoning — implemented (read side)
 
-- Add coarse class-prior intervals and manual container metadata.
-- Add interval fit checks and usable-interior/opening-state reasoning.
-- Only then may a candidate be promoted to `possibly_contained_in`, and only
-  when container semantics plus compatible size/depth evidence support it.
-- Keep `unknown` when opening state or interior dimensions are unavailable.
+- `item-query --priors <file>` loads a TOML file of object size intervals
+  and per-camera/zone container records (role, opening state, usable interior
+  intervals); see `crates/item-query/priors.example.toml`. Built-in class
+  priors cover the default VLM targets and the G2 cover vocabulary. Nothing is
+  persisted: priors are configuration, and each candidate carries a
+  `priors_ref` (built-in version plus file path and content hash) so a result
+  can be traced to the priors that produced it.
+- Fit is the §7.3 interval check: `fits` when the object's largest extents
+  fit the interior's smallest in some axis-aligned orientation; `not_fits`
+  only when an extent is certainly longer than the interior's space diagonal;
+  otherwise `unknown`. No packing is attempted.
+- `possibly_contained_in` requires all of: a priors-file container entry
+  (built-in class priors never promote), `opening_state = open`, a fit, a
+  cover reaching over at least 50% of the target's last box, unambiguous
+  identity, and every G2 gate. A size conflict or closed/unclear opening keeps
+  the G2 relation and records the conflicting/unknown evidence; a `cover` role
+  never contains; a person or hand only occludes.
+- Not implemented: opening size vs. object cross-section, visual estimation
+  of opening state or interior, metric size from calibrated depth, and
+  persisting accepted inferences (§6.2).
 
 ### Phase G5: query and UI evidence cards — future
 

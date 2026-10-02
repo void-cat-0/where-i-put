@@ -1,0 +1,48 @@
+# G4 size and container priors for `item-query --priors <file>`.
+#
+# Everything here is information a person supplies; none of it is observed.
+# Lengths are closed intervals in metres, [min, max]. Axes carry no orientation:
+# the fit check tries every axis-aligned assignment, and an extent you do not
+# know is simply left out (it stays "unknown" rather than being guessed).
+#
+# A candidate is promoted from `possibly_under` to `possibly_contained_in` only
+# when ALL of these hold for the covering object:
+#   - it has a [[container]] entry in this file with role = "container",
+#   - opening_state = "open",
+#   - all three interior extents are given, and
+#   - the target, at the LARGEST size of its prior, fits that interior at its
+#     SMALLEST in some axis-aligned orientation.
+# The built-in class priors (box, drawer, bag, ...) never promote on their own.
+
+# Object sizes. An entry here replaces the built-in prior for that label whole.
+[[object]]
+label = "keys"
+length_m = [0.06, 0.09]
+width_m = [0.03, 0.05]
+height_m = [0.005, 0.03]
+note = "house + bike key on one ring"
+
+# A measured, open shoebox on the desk camera's `desk` zone.
+# Matching order: camera + zone, then camera, then label only; entries in this
+# file shadow the built-in class prior of the same label.
+[[container]]
+label = "box"
+camera = "desk"
+zone = "desk"
+role = "container"
+opening_state = "open"          # open / closed / unclear
+interior_length_m = [0.28, 0.30]
+interior_width_m = [0.17, 0.18]
+interior_height_m = [0.09, 0.10]
+note = "shoebox, lid kept off"
+
+# Any other box: a container whose opening is not known. Stays possibly_under.
+[[container]]
+label = "box"
+role = "container"
+opening_state = "unclear"
+
+# A cover can hide an item but never holds one; it takes no opening or interior.
+[[container]]
+label = "towel"
+role = "cover"

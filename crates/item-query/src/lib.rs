@@ -3,6 +3,7 @@
 //! v1 lookup is a plain label substring search over observations; the VLM
 //! sidecar (OpenAI-compatible endpoint) formats the answer when configured.
 
+pub mod affordance;
 pub mod containment;
 pub mod vlm;
 
@@ -79,7 +80,7 @@ pub fn build_prompt_with_candidates(
         for candidate in candidates {
             writeln!(
                 s,
-                "- {} may be {} {}; heuristic score {:.2}; {}",
+                "- {} {} {}; heuristic score {:.2}; {}",
                 candidate.target_label,
                 candidate.relation,
                 candidate.cover_label,

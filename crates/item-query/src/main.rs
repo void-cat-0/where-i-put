@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 
 use chrono::Duration;
 use item_core::store::Store;
+use item_query::affordance::Priors;
 use item_query::build_prompt_with_candidates;
 use item_query::containment::{Candidate, find_candidates};
 use item_query::vlm::VlmClient;
@@ -22,6 +23,12 @@ use item_query::vlm::VlmClient;
 struct Args {
     #[arg(long, default_value = "data/items.db", global = true)]
     db: String,
+
+    /// TOML file of measured containers and object sizes (G4); see
+    /// crates/item-query/priors.example.toml. Without it, only the built-in
+    /// class priors apply and no candidate is promoted to containment.
+    #[arg(long, global = true)]
+    priors: Option<std::path::PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -41,7 +48,8 @@ enum Cmd {
         #[arg(long)]
         label: Option<String>,
     },
-    /// List conservative 2-D disappearance/cover hypotheses.
+    /// List conservative disappearance/cover hypotheses (2-D overlap, plus
+    /// size/container evidence from the priors).
     Candidates {
         label: String,
         #[arg(long)]
@@ -60,6 +68,16 @@ async fn main() -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     let args = Args::parse();
+    // Load priors before the database: a bad priors file is a typo to fix,
+    // not something to answer around.
+    let loaded;
+    let priors = match &args.priors {
+        Some(path) => {
+            loaded = Priors::load(path)?;
+            &loaded
+        }
+        None => Priors::builtin(),
+    };
     let store = Store::open_read_only(&args.db).with_context(|| {
         format!(
             "reading {} (has the ingest loop written it yet? --db selects another one)",
@@ -90,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
                 camera.as_deref(),
                 Duration::seconds(window_secs.clamp(1, 86_400)),
                 limit,
+                priors,
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&candidates)?);
@@ -108,11 +127,12 @@ async fn main() -> anyhow::Result<()> {
                 println!("no sightings recorded for '{word}'");
                 return Ok(());
             }
-            let candidates = query_candidates(&store, &obs, None, Duration::seconds(10), 200)
-                .unwrap_or_else(|error| {
-                    eprintln!("cover evidence unavailable: {error}");
-                    Vec::new()
-                });
+            let candidates =
+                query_candidates(&store, &obs, None, Duration::seconds(10), 200, priors)
+                    .unwrap_or_else(|error| {
+                        eprintln!("cover evidence unavailable: {error}");
+                        Vec::new()
+                    });
             let prompt = build_prompt_with_candidates(&question, &obs, &candidates);
             match (
                 std::env::var("ITEM_VLM_BASE_URL"),
@@ -145,6 +165,7 @@ fn query_candidates(
     camera: Option<&str>,
     window: Duration,
     limit: i64,
+    priors: &Priors,
 ) -> anyhow::Result<Vec<Candidate>> {
     let mut candidates = Vec::new();
     for observation in observations {
@@ -156,7 +177,7 @@ fn query_candidates(
         let since = observation.last_seen - window;
         let until = observation.last_seen + window.max(Duration::seconds(31));
         let events = store.scene_events_for_camera(&observation.camera_id, since, until, limit)?;
-        for candidate in find_candidates(&events, &observation.label, window) {
+        for candidate in find_candidates(&events, &observation.label, window, priors) {
             if candidate.target_observation_id == observation.id {
                 candidates.push(candidate);
             }
@@ -195,6 +216,17 @@ fn print_candidates(candidates: &[Candidate]) {
             candidate.score,
             candidate.explanation
         );
+        for evidence in &candidate.evidence {
+            if matches!(
+                evidence.kind,
+                "size" | "semantic_affordance" | "containment_gate"
+            ) {
+                println!(
+                    "    {} [{}]: {}",
+                    evidence.kind, evidence.state, evidence.detail
+                );
+            }
+        }
     }
 }
 

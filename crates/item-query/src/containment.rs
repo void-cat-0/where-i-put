@@ -1,13 +1,18 @@
-//! Conservative 2-D disappearance/cover candidate rules (G2).
+//! Conservative disappearance/cover candidate rules: G2 2-D matching, G4 size
+//! and affordance evidence.
 //!
-//! These are deterministic hypotheses, not calibrated probabilities and never
-//! physical containment claims. Missing depth or size evidence stays unknown.
+//! These are deterministic hypotheses, not calibrated probabilities. The
+//! strongest relation, `possibly_contained_in`, still only says "may be
+//! inside"; it needs a container recorded as open with a measured interior the
+//! target fits (see `affordance`). Missing depth or size evidence stays unknown.
 
 use chrono::{DateTime, Duration, Utc};
 use item_core::{DepthEvidence, ObservationGeometry, SceneEvent};
 use serde::Serialize;
 
-pub const RULE_VERSION: &str = "g2-2d-2";
+use crate::affordance::{Priors, assess, is_person_label};
+
+pub const RULE_VERSION: &str = "g4-size-1";
 pub const MIN_COVER_HITS: i64 = 2;
 pub const MIN_COVER_PERSISTENCE: Duration = Duration::seconds(2);
 
@@ -34,6 +39,8 @@ pub struct Candidate {
     pub score: f32,
     pub same_label_ambiguous: bool,
     pub rule_version: &'static str,
+    /// Which size/container priors produced the G4 evidence.
+    pub priors_ref: String,
     pub explanation: String,
     pub evidence: Vec<EvidenceContribution>,
 }
@@ -49,6 +56,7 @@ pub fn find_candidates(
     events: &[SceneEvent],
     target_label: &str,
     window: Duration,
+    priors: &Priors,
 ) -> Vec<Candidate> {
     let window = window.max(Duration::zero());
     let mut out = Vec::new();
@@ -88,8 +96,32 @@ pub fn find_candidates(
 
             let same_label_ambiguous = target.event.label.eq_ignore_ascii_case(&cover.event.label);
             let person = is_person_label(&cover.event.label);
-            let cover_prior = is_cover_label(&cover.event.label);
-            let relation = if cover_prior && !person {
+            let container_prior = if person {
+                None
+            } else {
+                priors.container(
+                    &cover.event.label,
+                    &target.event.camera_id,
+                    &target_geo.zone,
+                )
+            };
+            let cover_prior = container_prior.is_some();
+            let assessment = container_prior.map(|container| {
+                assess(
+                    &target.event.label,
+                    priors.object(&target.event.label),
+                    container,
+                )
+            });
+            // Identity has to be settled before a size fit can mean anything,
+            // and a cover's geometry must at least reach over most of the
+            // target's last box before "inside" is worth saying.
+            let contained = assessment.as_ref().is_some_and(|a| a.promotable)
+                && !same_label_ambiguous
+                && overlap.coverage >= 0.5;
+            let relation = if contained {
+                "possibly_contained_in"
+            } else if cover_prior {
                 "possibly_under"
             } else {
                 "possibly_occluded_by"
@@ -159,14 +191,66 @@ pub fn find_candidates(
                     detail: "cover and target have the same label; identity is ambiguous".into(),
                 });
             }
-            if !cover_prior {
-                evidence.push(EvidenceContribution {
+            match &assessment {
+                Some(assessment) => {
+                    evidence.push(EvidenceContribution {
+                        kind: "semantic_affordance",
+                        state: assessment.affordance.state,
+                        detail: assessment.affordance.detail.clone(),
+                    });
+                    if let Some(size) = &assessment.size {
+                        evidence.push(EvidenceContribution {
+                            kind: "size",
+                            state: size.state,
+                            detail: size.detail.clone(),
+                        });
+                    }
+                    if assessment.promotable && !contained {
+                        evidence.push(EvidenceContribution {
+                            kind: "containment_gate",
+                            state: "unknown",
+                            detail: if same_label_ambiguous {
+                                "the size fit is not used: target and cover identity are ambiguous"
+                                    .into()
+                            } else {
+                                format!(
+                                    "the cover reaches over only {:.0}% of the target's last box (containment needs 50%)",
+                                    overlap.coverage * 100.0
+                                )
+                            },
+                        });
+                    }
+                }
+                None => evidence.push(EvidenceContribution {
                     kind: "semantic_affordance",
                     state: "unknown",
-                    detail: "cover label has no container/cover prior; relation remains occlusion"
-                        .into(),
-                });
+                    detail: if person {
+                        "a person or hand can only occlude; relation remains occlusion".into()
+                    } else {
+                        "cover label has no container/cover prior; relation remains occlusion"
+                            .into()
+                    },
+                }),
             }
+
+            let explanation = if contained {
+                format!(
+                    "{} was last directly seen near {}; {} (recorded as an open container whose interior fits it) then covered {:.0}% of that image area and persisted. The {} may be inside it; this is a qualified hypothesis, not an observation.",
+                    target.event.label,
+                    target_geo.zone,
+                    cover.event.label,
+                    overlap.coverage * 100.0,
+                    target.event.label,
+                )
+            } else {
+                format!(
+                    "{} was last directly seen near {}; {} then covered {:.0}% of that image area and persisted. This is a 2-D visibility hypothesis, not proof of containment.",
+                    target.event.label,
+                    target_geo.zone,
+                    cover.event.label,
+                    overlap.coverage * 100.0
+                )
+            };
 
             out.push(Candidate {
                 target_event_id: target.event.id,
@@ -181,13 +265,8 @@ pub fn find_candidates(
                 score,
                 same_label_ambiguous,
                 rule_version: RULE_VERSION,
-                explanation: format!(
-                    "{} was last directly seen near {}; {} then covered {:.0}% of that image area and persisted. This is a 2-D visibility hypothesis, not proof of containment.",
-                    target.event.label,
-                    target_geo.zone,
-                    cover.event.label,
-                    overlap.coverage * 100.0
-                ),
+                priors_ref: priors.reference().to_owned(),
+                explanation,
                 evidence,
             });
         }
@@ -447,20 +526,6 @@ fn usable_depth(depth: &[DepthEvidence]) -> Option<&DepthEvidence> {
     })
 }
 
-fn is_person_label(label: &str) -> bool {
-    matches!(
-        label.to_ascii_lowercase().as_str(),
-        "person" | "human" | "hand" | "people"
-    )
-}
-
-fn is_cover_label(label: &str) -> bool {
-    matches!(
-        label.to_ascii_lowercase().as_str(),
-        "box" | "book" | "bag" | "drawer" | "cabinet" | "basket" | "tray" | "cloth" | "lid"
-    )
-}
-
 fn within_last_hit_window(at: DateTime<Utc>, last_hit: DateTime<Utc>, window: Duration) -> bool {
     let delta = at.signed_duration_since(last_hit);
     delta >= -window && delta <= window
@@ -529,6 +594,213 @@ mod tests {
         }
     }
 
+    fn find(events: &[SceneEvent]) -> Vec<Candidate> {
+        find_candidates(events, "keys", Duration::seconds(10), Priors::builtin())
+    }
+
+    fn find_with(events: &[SceneEvent], priors: &Priors) -> Vec<Candidate> {
+        find_candidates(events, "keys", Duration::seconds(10), priors)
+    }
+
+    /// Keys vanish at t=0; a cover labelled `cover` was there from t=-1 and
+    /// closed at t=3 with `cover_bbox` over the keys' [10,10,40,40] box.
+    fn keys_then(cover: &str, cover_bbox: [f32; 4]) -> Vec<SceneEvent> {
+        vec![
+            event(
+                1,
+                1,
+                "keys",
+                "disappeared",
+                0,
+                "missed_gap",
+                Some("s"),
+                [10.0, 10.0, 40.0, 40.0],
+                3,
+                Some(3.0),
+            ),
+            event(
+                2,
+                2,
+                cover,
+                "appeared",
+                -1,
+                "appeared",
+                Some("s"),
+                cover_bbox,
+                1,
+                None,
+            ),
+            event(
+                3,
+                2,
+                cover,
+                "disappeared",
+                3,
+                "missed_gap",
+                Some("s"),
+                cover_bbox,
+                3,
+                Some(4.0),
+            ),
+        ]
+    }
+
+    fn priors(text: &str) -> Priors {
+        Priors::from_toml_str(text, "test-priors".into()).unwrap()
+    }
+
+    const OPEN_SHOEBOX: &str = "[[container]]\nlabel = \"box\"\ncamera = \"cam\"\nrole = \"container\"\n\
+        opening_state = \"open\"\ninterior_length_m = [0.28, 0.30]\ninterior_width_m = [0.17, 0.18]\n\
+        interior_height_m = [0.09, 0.10]\n";
+
+    fn evidence<'a>(candidate: &'a Candidate, kind: &str) -> Option<&'a EvidenceContribution> {
+        candidate
+            .evidence
+            .iter()
+            .find(|evidence| evidence.kind == kind)
+    }
+
+    #[test]
+    fn an_open_measured_container_that_fits_promotes_to_possibly_contained_in() {
+        let candidates = find_with(
+            &keys_then("box", [5.0, 5.0, 50.0, 50.0]),
+            &priors(OPEN_SHOEBOX),
+        );
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.relation, "possibly_contained_in");
+        assert_eq!(candidate.rule_version, "g4-size-1");
+        assert_eq!(candidate.priors_ref, "test-priors");
+        assert_eq!(evidence(candidate, "size").unwrap().state, "supporting");
+        assert_eq!(
+            evidence(candidate, "semantic_affordance").unwrap().state,
+            "supporting"
+        );
+        assert!(candidate.explanation.contains("may be inside"));
+        assert!(candidate.explanation.contains("not an observation"));
+    }
+
+    #[test]
+    fn builtin_priors_alone_never_claim_containment() {
+        let candidates = find(&keys_then("box", [5.0, 5.0, 50.0, 50.0]));
+        assert_eq!(candidates[0].relation, "possibly_under");
+        assert_eq!(evidence(&candidates[0], "size").unwrap().state, "unknown");
+        assert_eq!(
+            evidence(&candidates[0], "semantic_affordance")
+                .unwrap()
+                .state,
+            "unknown"
+        );
+        assert_eq!(
+            candidates[0].priors_ref,
+            crate::affordance::BUILTIN_PRIORS_REF
+        );
+    }
+
+    #[test]
+    fn closed_or_unclear_or_too_small_containers_stay_under() {
+        let closed = OPEN_SHOEBOX.replace("\"open\"", "\"closed\"");
+        let candidates = find_with(&keys_then("box", [5.0, 5.0, 50.0, 50.0]), &priors(&closed));
+        assert_eq!(candidates[0].relation, "possibly_under");
+
+        let unclear = OPEN_SHOEBOX.replace("\"open\"", "\"unclear\"");
+        let candidates = find_with(&keys_then("box", [5.0, 5.0, 50.0, 50.0]), &priors(&unclear));
+        assert_eq!(candidates[0].relation, "possibly_under");
+
+        let ring_box = "[[container]]\nlabel = \"box\"\nrole = \"container\"\nopening_state = \"open\"\n\
+            interior_length_m = [0.03, 0.04]\ninterior_width_m = [0.03, 0.04]\ninterior_height_m = [0.02, 0.03]\n\
+            [[object]]\nlabel = \"keys\"\nlength_m = [0.08, 0.10]\n";
+        let candidates = find_with(&keys_then("box", [5.0, 5.0, 50.0, 50.0]), &priors(ring_box));
+        assert_eq!(
+            candidates.len(),
+            1,
+            "a size conflict does not hide the cover hypothesis"
+        );
+        assert_eq!(candidates[0].relation, "possibly_under");
+        assert_eq!(
+            evidence(&candidates[0], "size").unwrap().state,
+            "conflicting"
+        );
+    }
+
+    #[test]
+    fn the_container_scope_must_match_the_targets_camera() {
+        let elsewhere = OPEN_SHOEBOX.replace("camera = \"cam\"", "camera = \"hall\"");
+        let candidates = find_with(
+            &keys_then("box", [5.0, 5.0, 50.0, 50.0]),
+            &priors(&elsewhere),
+        );
+        assert_eq!(
+            candidates[0].relation, "possibly_under",
+            "the built-in box applies instead"
+        );
+    }
+
+    #[test]
+    fn a_cover_role_or_a_glancing_overlap_blocks_promotion() {
+        let candidates = find_with(
+            &keys_then("book", [5.0, 5.0, 50.0, 50.0]),
+            &priors(OPEN_SHOEBOX),
+        );
+        assert_eq!(candidates[0].relation, "possibly_under");
+        assert_eq!(
+            evidence(&candidates[0], "semantic_affordance")
+                .unwrap()
+                .state,
+            "conflicting"
+        );
+        assert!(evidence(&candidates[0], "size").is_none());
+
+        // The box reaches over 20% of the keys' box: still a cover candidate,
+        // but not enough to say "inside".
+        let candidates = find_with(
+            &keys_then("box", [34.0, 5.0, 60.0, 60.0]),
+            &priors(OPEN_SHOEBOX),
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].relation, "possibly_under");
+        let gate = evidence(&candidates[0], "containment_gate").unwrap();
+        assert!(gate.detail.contains("50%"), "{}", gate.detail);
+    }
+
+    #[test]
+    fn a_file_entry_can_make_a_new_label_a_cover_but_a_person_stays_an_occluder() {
+        let towel = "[[container]]\nlabel = \"towel\"\nrole = \"cover\"\n";
+        let candidates = find_with(&keys_then("towel", [5.0, 5.0, 50.0, 50.0]), &priors(towel));
+        assert_eq!(candidates[0].relation, "possibly_under");
+
+        let candidates = find(&keys_then("towel", [5.0, 5.0, 50.0, 50.0]));
+        assert_eq!(candidates[0].relation, "possibly_occluded_by");
+
+        let candidates = find_with(
+            &keys_then("hand", [5.0, 5.0, 50.0, 50.0]),
+            &priors(OPEN_SHOEBOX),
+        );
+        assert_eq!(candidates[0].relation, "possibly_occluded_by");
+    }
+
+    #[test]
+    fn same_label_identity_ambiguity_blocks_promotion() {
+        let mut events = keys_then("box", [5.0, 5.0, 50.0, 50.0]);
+        for event in &mut events {
+            event.event.label = "box".into();
+        }
+        let both_boxes = format!(
+            "{OPEN_SHOEBOX}[[object]]\nlabel = \"box\"\nlength_m = [0.05, 0.06]\nwidth_m = [0.05, 0.06]\nheight_m = [0.05, 0.06]\n"
+        );
+        let candidates =
+            find_candidates(&events, "box", Duration::seconds(10), &priors(&both_boxes));
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].same_label_ambiguous);
+        assert_eq!(candidates[0].relation, "possibly_under");
+        assert!(
+            evidence(&candidates[0], "containment_gate")
+                .unwrap()
+                .detail
+                .contains("ambiguous")
+        );
+    }
+
     #[test]
     fn accepts_persistent_cover_using_last_geometry_without_containment_claim() {
         let events = vec![
@@ -569,7 +841,7 @@ mod tests {
                 Some(4.0),
             ),
         ];
-        let candidates = find_candidates(&events, "keys", Duration::seconds(10));
+        let candidates = find(&events);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].relation, "possibly_under");
         assert!(!candidates[0].explanation.contains("inside"));
@@ -616,10 +888,8 @@ mod tests {
             2,
             Some(2.0),
         );
-        assert!(
-            find_candidates(&[target.clone(), cover], "keys", Duration::seconds(10)).is_empty()
-        );
-        assert!(find_candidates(&[target, reappeared], "keys", Duration::seconds(10)).is_empty());
+        assert!(find(&[target.clone(), cover]).is_empty());
+        assert!(find(&[target, reappeared]).is_empty());
 
         let target = event(
             4,
@@ -645,7 +915,7 @@ mod tests {
             3,
             Some(3.0),
         );
-        assert!(find_candidates(&[target, cover], "keys", Duration::seconds(10)).is_empty());
+        assert!(find(&[target, cover]).is_empty());
     }
 
     #[test]
@@ -674,7 +944,7 @@ mod tests {
             1,
             None,
         );
-        assert!(find_candidates(&[target, cover], "keys", Duration::seconds(10)).is_empty());
+        assert!(find(&[target, cover]).is_empty());
     }
 
     #[test]
@@ -715,7 +985,7 @@ mod tests {
             3,
             Some(3.0),
         );
-        let candidates = find_candidates(&[target, person, closed], "keys", Duration::seconds(10));
+        let candidates = find(&[target, person, closed]);
         assert_eq!(candidates[0].relation, "possibly_occluded_by");
     }
 
@@ -784,14 +1054,10 @@ mod tests {
             calibration_ref: None,
         });
         cover.geometry.as_mut().unwrap().captured_at = at(0);
-        let candidates = find_candidates(
-            &[target.clone(), cover.clone()],
-            "keys",
-            Duration::seconds(10),
-        );
+        let candidates = find(&[target.clone(), cover.clone()]);
         assert!(candidates.is_empty());
         cover.geometry.as_mut().unwrap().captured_at = at(2);
-        let candidates = find_candidates(&[target, cover], "keys", Duration::seconds(10));
+        let candidates = find(&[target, cover]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(
             candidates[0]
@@ -924,7 +1190,7 @@ mod tests {
         let events = store
             .scene_events_for_camera("cam", at(-10), at(10), 100)
             .unwrap();
-        let candidates = find_candidates(&events, "keys", Duration::seconds(10));
+        let candidates = find(&events);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].cover_observation_id, cover_id);
     }
