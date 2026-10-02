@@ -25,7 +25,19 @@ fn main() {
         );
         return;
     };
-    let bin = Path::new(&ffmpeg_dir).join("bin");
+    let ffmpeg_path = Path::new(&ffmpeg_dir);
+    // Unix targets load lib/*.so (or .dylib) at run time, and nothing puts that
+    // directory on the loader path: bake it in as an rpath, whichever layout
+    // (BtbN zip or source build) produced it. The target, not the build host,
+    // decides this, hence the env var rather than #[cfg].
+    if env::var("CARGO_CFG_TARGET_FAMILY").is_ok_and(|f| f.split(',').any(|f| f == "unix")) {
+        let lib = ffmpeg_path.join("lib");
+        if lib.is_dir() {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+        }
+        return;
+    }
+    let bin = ffmpeg_path.join("bin");
     let dlls: Vec<PathBuf> = match fs::read_dir(&bin) {
         Ok(rd) => rd
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -33,16 +45,6 @@ fn main() {
             .collect(),
         Err(e) => {
             println!("cargo:warning=reading {}: {e}", bin.display());
-            // On Linux, source builds put .so files in lib/, not bin/.
-            // Emit rpath so the binary finds them at runtime.
-            #[cfg(target_family = "unix")]
-            {
-                let lib = Path::new(&ffmpeg_dir).join("lib");
-                if lib.is_dir() {
-                    println!("cargo:rustc-link-search=native={}", lib.display());
-                    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
-                }
-            }
             return;
         }
     };
