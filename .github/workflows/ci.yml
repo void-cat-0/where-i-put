@@ -105,9 +105,24 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          # BtbN's linux .so files carry no RUNPATH of their own, and a binary's
+          # DT_RUNPATH does not cover its libraries' dependencies, so the loader
+          # needs the directory explicitly.
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            export LD_LIBRARY_PATH="$PWD/target/vendor/ffmpeg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
           cargo test --workspace --features rtsp 2>&1 | tee test.log || {
-            grep -iE "^error|panicked|FAILED" test.log | head -30 | sed 's/^/::error::/'
-            tail -30 test.log | sed 's/^/::error::/' ; exit 1; }
+            grep -iE "^error|panicked|FAILED|shared object" test.log | head -30 | sed 's/^/::error::/'
+            tail -30 test.log | sed 's/^/::error::/'
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              bin=$(ls -t target/debug/deps/item_ingest-* 2>/dev/null | grep -v '\.d$' | head -1)
+              { echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+                ls -la target/vendor/ffmpeg/lib | head -40
+                [ -n "$bin" ] && readelf -d "$bin" | grep -E 'NEEDED|RUNPATH|RPATH'
+                [ -n "$bin" ] && ldd "$bin" | grep -E 'av|sw|not found'
+              } 2>&1 | sed 's/^/::error::diag: /'
+            fi
+            exit 1; }
 
   # from-source builds of pinned FFmpeg. Linux only for now: Windows needs a
   # proven MSVC+MSYS2 configure handshake, macOS needs the brew/trust and
