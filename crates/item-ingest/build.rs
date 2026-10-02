@@ -33,6 +33,7 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_FAMILY").is_ok_and(|f| f.split(',').any(|f| f == "unix")) {
         let lib = ffmpeg_path.join("lib");
         if lib.is_dir() {
+            println!("cargo:rustc-link-search=native={}", lib.display());
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
         }
         return;
